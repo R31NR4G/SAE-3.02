@@ -78,6 +78,7 @@ def main():
         "routers": {}   # id -> public_key
     }
 
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen()

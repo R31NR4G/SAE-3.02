@@ -166,6 +166,7 @@ def main():
 
             print(f"[CLIENT {my_id}] Message envoyé vers {dest_id} via R{r1['id']}->{r2['id']}->{r3['id']}")
 
+
     except KeyboardInterrupt:
         print("\n[CLIENT] Interruption")
     finally:

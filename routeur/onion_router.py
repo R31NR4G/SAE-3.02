@@ -123,6 +123,7 @@ def main():
     listen_sock.listen()
     print(f"[ROUTEUR {router_id}] En écoute sur {r_host}:{r_port}")
 
+
     try:
         while True:
             conn, addr = listen_sock.accept()
