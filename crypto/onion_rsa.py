@@ -126,3 +126,4 @@ def decrypt_str(cipher_text: str, private_key: PrivateKey, encoding: str = "utf-
         plain_bytes.extend(block_plain)
 
     return plain_bytes.decode(encoding)
+
