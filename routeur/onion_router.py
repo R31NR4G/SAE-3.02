@@ -2,8 +2,14 @@ import json
 import socket
 import threading
 from pathlib import Path
-import random
 import sys
+
+# --- pour import crypto.onion_rsa ---
+PROJECT_ROOT = Path(__file__).parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from crypto.onion_rsa import decrypt_str, generate_keypair, PrivateKey, PublicKey
 
 
 def load_config():
@@ -11,20 +17,6 @@ def load_config():
     config_path = Path(__file__).parents[1] / "config" / "config.json"
     with config_path.open(encoding="utf-8") as f:
         return json.load(f)
-
-
-# === "chiffrement" jouet (XOR + hex) ===
-
-def encrypt(plaintext: str, key: int) -> str:
-    data = plaintext.encode("utf-8")
-    xored = bytes(b ^ key for b in data)
-    return xored.hex()
-
-
-def decrypt(cipher_hex: str, key: int) -> str:
-    data = bytes.fromhex(cipher_hex)
-    xored = bytes(b ^ key for b in data)
-    return xored.decode("utf-8")
 
 
 def send_json(sock: socket.socket, obj: dict):
@@ -39,10 +31,10 @@ def forward_to(host: str, port: int, cipher: str):
         send_json(s, {"type": "onion_packet", "cipher": cipher})
 
 
-def handle_onion(conn: socket.socket, addr, key: int):
+def handle_onion(conn: socket.socket, addr, private_key: PrivateKey):
     """
     Gère un paquet onion :
-      - déchiffre une couche avec la clé du routeur
+      - déchiffre une couche avec la clé privée du routeur (RSA)
       - si 'next_host' présent -> forward au routeur suivant
       - sinon -> dernier routeur : envoie au client destination
     """
@@ -59,7 +51,9 @@ def handle_onion(conn: socket.socket, addr, key: int):
             return
 
         cipher = msg["cipher"]
-        inner_plain = decrypt(cipher, key)
+
+        # déchiffrement RSA
+        inner_plain = decrypt_str(cipher, private_key)
         inner = json.loads(inner_plain)
 
         # Cas 1 : encore un routeur dans la chaîne
@@ -95,6 +89,8 @@ def handle_onion(conn: socket.socket, addr, key: int):
 
 
 def main():
+    import sys
+
     config = load_config()
 
     # --- choix de l'id du routeur ---
@@ -107,9 +103,13 @@ def main():
     r_host = r_info["host"]
     r_port = r_info["port"]
 
-    # Clé simplifiée (1..255)
-    key = random.randint(1, 255)
-    print(f"[ROUTEUR {router_id}] Clé (simplifiée) = {key}")
+    # Génération paire de clés RSA pour ce routeur
+    public_key: PublicKey
+    private_key: PrivateKey
+    public_key, private_key = generate_keypair(bits=2048)
+
+    n_pub, e = public_key
+    print(f"[ROUTEUR {router_id}] Clé publique RSA générée (n={n_pub}, e={e})")
 
     # --- connexion au master pour envoyer la clé publique ---
     master_h = config["master"]["host"]
@@ -120,9 +120,12 @@ def main():
             send_json(ms, {
                 "type": "router_register",
                 "router_id": router_id,
-                "public_key": key
+                "public_key": {
+                    "n": n_pub,
+                    "e": e
+                }
             })
-        print(f"[ROUTEUR {router_id}] Clé envoyée au master")
+        print(f"[ROUTEUR {router_id}] Clé publique envoyée au master")
     except OSError as e:
         print(f"[ROUTEUR {router_id}] Impossible de joindre le master : {e}")
 
@@ -137,7 +140,7 @@ def main():
             conn, addr = listen_sock.accept()
             t = threading.Thread(
                 target=handle_onion,
-                args=(conn, addr, key),
+                args=(conn, addr, private_key),
                 daemon=True
             )
             t.start()

@@ -4,26 +4,19 @@ import threading
 from pathlib import Path
 import sys
 
+# --- pour pouvoir importer crypto.onion_rsa même si on lance client/onion_client.py directement ---
+PROJECT_ROOT = Path(__file__).parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from crypto.onion_rsa import encrypt_str, PublicKey  # RSA
+
 
 def load_config():
     """Charge config/config.json à partir de la racine du projet."""
     config_path = Path(__file__).parents[1] / "config" / "config.json"
     with config_path.open(encoding="utf-8") as f:
         return json.load(f)
-
-
-# === "chiffrement" jouet (XOR + hex) ===
-
-def encrypt(plaintext: str, key: int) -> str:
-    data = plaintext.encode("utf-8")
-    xored = bytes(b ^ key for b in data)
-    return xored.hex()
-
-
-def decrypt(cipher_hex: str, key: int) -> str:
-    data = bytes.fromhex(cipher_hex)
-    xored = bytes(b ^ key for b in data)
-    return xored.decode("utf-8")
 
 
 def send_json(sock: socket.socket, obj: dict):
@@ -55,7 +48,6 @@ def handle_delivery(conn: socket.socket, addr, my_id: str):
 def listen_incoming(my_id: str, listen_host: str, listen_port: int):
     """Thread d’écoute pour recevoir les messages envoyés par les routeurs."""
     ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # évite WinError 10048 si on relance souvent le client
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ls.bind((listen_host, listen_port))
     ls.listen()
@@ -77,7 +69,7 @@ def listen_incoming(my_id: str, listen_host: str, listen_port: int):
 
 
 def get_router_info_from_master(config):
-    """Demande au master la liste des routeurs et leurs clés publiques."""
+    """Demande au master la liste des routeurs et leurs clés publiques RSA."""
     master_h = config["master"]["host"]
     master_p = config["master"]["port"]
 
@@ -119,18 +111,30 @@ def main():
     )
     t_listen.start()
 
-    # --- récupère infos et clés des routeurs ---
+    # --- récupère infos et clés publiques RSA des routeurs ---
     routers = get_router_info_from_master(config)
-    if len(routers) < 3:
-        print("[CLIENT] Moins de 3 routeurs disponibles.")
+
+    # on ne garde que ceux qui ont une clé publique
+    routers_with_key = [r for r in routers if r["public_key"] is not None]
+
+    if len(routers_with_key) < 3:
+        print("[CLIENT] Moins de 3 routeurs avec clé publique disponibles.")
         return
 
-    # Chemin R1 -> R2 -> R3 = 3 premiers routeurs
-    r1, r2, r3 = routers[0], routers[1], routers[2]
-    k1, k2, k3 = r1["public_key"], r2["public_key"], r3["public_key"]
+    # Chemin R1 -> R2 -> R3 = 3 premiers routeurs avec clé
+    r1, r2, r3 = routers_with_key[0], routers_with_key[1], routers_with_key[2]
+
+    # reconstruction des clés publiques RSA (n, e)
+    def to_pubkey(r) -> PublicKey:
+        pk = r["public_key"]
+        return pk["n"], pk["e"]
+
+    k1: PublicKey = to_pubkey(r1)
+    k2: PublicKey = to_pubkey(r2)
+    k3: PublicKey = to_pubkey(r3)
 
     print(f"[CLIENT {my_id}] Chemin utilisé : R{r1['id']} -> R{r2['id']} -> R{r3['id']}")
-    print(f"[CLIENT {my_id}] Clés (simplifiées) : {k1}, {k2}, {k3}")
+    print(f"[CLIENT {my_id}] Clés publiques récupérées.")
     print("Format : DEST: message   (ex: B: salut)")
 
     try:
@@ -157,8 +161,8 @@ def main():
             dest_host = dest_info["host"]
             dest_port = dest_info["listen_port"]
 
-            # --- construction des couches C3, C2, C1 ---
-            # C3 = Enc_{K3} ( Dest(Client) + message final )
+            # --- construction des couches C3, C2, C1 avec RSA ---
+            # C3 = Enc_{K3} ( {dest_host, dest_port, from_id, to_id, message} )
             layer3 = {
                 "dest_host": dest_host,
                 "dest_port": dest_port,
@@ -166,7 +170,7 @@ def main():
                 "to_id": dest_id,
                 "message": msg_plain
             }
-            C3 = encrypt(json.dumps(layer3), k3)
+            C3 = encrypt_str(json.dumps(layer3), k3)
 
             # C2 = Enc_{K2} ( Dest(R3) + C3 )
             layer2 = {
@@ -174,7 +178,7 @@ def main():
                 "next_port": r3["port"],
                 "inner": C3
             }
-            C2 = encrypt(json.dumps(layer2), k2)
+            C2 = encrypt_str(json.dumps(layer2), k2)
 
             # C1 = Enc_{K1} ( Dest(R2) + C2 )
             layer1 = {
@@ -182,7 +186,7 @@ def main():
                 "next_port": r2["port"],
                 "inner": C2
             }
-            C1 = encrypt(json.dumps(layer1), k1)
+            C1 = encrypt_str(json.dumps(layer1), k1)
 
             # Envoi de C1 au premier routeur du chemin
             try:

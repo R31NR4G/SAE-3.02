@@ -21,7 +21,7 @@ def handle_connection(conn: socket.socket, addr, state: dict):
     """
     Gère une connexion (routeur ou client) dans un thread.
     Types de messages :
-      - router_register      : un routeur envoie son id + clé publique
+      - router_register      : un routeur envoie son id + clé publique RSA
       - router_info_request  : un client demande la liste des routeurs
       - router_info          : réponse envoyée au client
     """
@@ -44,9 +44,9 @@ def handle_connection(conn: socket.socket, addr, state: dict):
             # 1) Enregistrement d'un routeur
             if mtype == "router_register":
                 rid = msg["router_id"]
-                pubkey = msg["public_key"]
+                pubkey = msg["public_key"]   # dict {"n":..., "e":...}
                 state["routers"][rid] = pubkey
-                print(f"[MASTER] Routeur {rid} enregistré, clé={pubkey}")
+                print(f"[MASTER] Routeur {rid} enregistré, clé_publique={pubkey}")
 
             # 2) Demande d'info routeurs par un client
             elif mtype == "router_info_request":
@@ -87,7 +87,7 @@ def main():
 
     state = {
         "config": config,
-        "routers": {}   # id -> public_key
+        "routers": {}   # id -> public_key (dict {"n","e"})
     }
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
