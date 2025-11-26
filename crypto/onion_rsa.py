@@ -1,5 +1,5 @@
 # crypto/onion_rsa.py
-# RSA très simplifié pour le projet SAE 3.02 (pédagogique)
+# RSA simplifié SAE 3.02
 
 import json
 import random

@@ -42,13 +42,6 @@ def journaliser_evenement(niveau: str, evenement: str, **infos):
         pass
 
 
-def load_config():
-    """Charge config/config.json à partir de la racine du projet."""
-    config_path = PROJET_RACINE / "config" / "config.json"
-    with config_path.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
 def envoyer_json(sock: socket.socket, obj: dict) -> bool:
     """Envoie un objet JSON suivi d'un \\n, avec journalisation en cas d'échec."""
     try:
@@ -79,7 +72,7 @@ def handle_connection(conn: socket.socket, addr, state: dict):
     Gère une connexion (routeur ou client) dans un thread.
 
     Messages possibles :
-      - router_register      : un routeur envoie son id + clé publique RSA
+      - router_register      : un routeur envoie son id + host + port + clé publique RSA
       - router_info_request  : un client demande la liste des routeurs
       - router_info          : réponse envoyée au client
     """
@@ -116,23 +109,37 @@ def handle_connection(conn: socket.socket, addr, state: dict):
                 print("[MASTER] Message sans champ 'type' de", addr)
                 continue
 
-            # 1) Enregistrement d'un routeur : clé publique RSA
+            # 1) Enregistrement d'un routeur : id + host + port + clé publique RSA
             if mtype == "router_register":
                 try:
                     rid = msg["router_id"]
                     pubkey = msg["public_key"]   # dict {"n": ..., "e": ...}
+                    r_host = msg["host"]
+                    r_port = msg["port"]
+
                     # petite validation de base
                     if not isinstance(pubkey, dict) or "n" not in pubkey or "e" not in pubkey:
                         raise ValueError("clé publique mal formée")
+                    if not isinstance(r_host, str):
+                        raise ValueError("host invalide")
+                    if not isinstance(r_port, int) or not (1 <= r_port <= 65535):
+                        raise ValueError("port invalide")
 
-                    state["routers"][rid] = pubkey
+                    state["routers"][rid] = {
+                        "id": rid,
+                        "host": r_host,
+                        "port": r_port,
+                        "public_key": pubkey,
+                    }
 
                     journaliser_evenement(
                         "INFO",
                         "routeur_enregistre",
                         routeur_id=rid,
+                        host=r_host,
+                        port=r_port,
                     )
-                    print(f"[MASTER] Routeur {rid} enregistré, clé_publique={pubkey}")
+                    print(f"[MASTER] Routeur {rid} enregistré, {r_host}:{r_port}, clé_publique={pubkey}")
                 except (KeyError, ValueError) as e:
                     journaliser_evenement(
                         "AVERTISSEMENT",
@@ -141,25 +148,12 @@ def handle_connection(conn: socket.socket, addr, state: dict):
                         erreur=str(e),
                         message=msg,
                     )
-                    print("[MASTER] Message router_register invalide de", addr)
+                    print("[MASTER] Message router_register invalide de", addr, ":", e)
 
             # 2) Demande d'info routeurs par un client
             elif mtype == "router_info_request":
-                config = state["config"]
-                routers_cfg = config.get("routeurs", [])
-
-                routers = []
-                for r in routers_cfg:
-                    rid = r.get("id")
-                    if rid is None:
-                        continue
-                    routers.append({
-                        "id": rid,
-                        "host": r.get("host"),
-                        "port": r.get("port"),
-                        # peut être None si le routeur ne s'est pas encore enregistré
-                        "public_key": state["routers"].get(rid)
-                    })
+                # On renvoie simplement la liste dynamique des routeurs enregistrés
+                routers = list(state["routers"].values())
 
                 reply = {
                     "type": "router_info",
@@ -172,7 +166,7 @@ def handle_connection(conn: socket.socket, addr, state: dict):
                     adresse=str(addr),
                     nb_routeurs=len(routers),
                 )
-                print(f"[MASTER] Infos routeurs envoyées à {addr}")
+                print(f"[MASTER] Infos routeurs envoyées à {addr} ({len(routers)} routeurs)")
 
             else:
                 journaliser_evenement(
@@ -209,14 +203,14 @@ def handle_connection(conn: socket.socket, addr, state: dict):
 
 
 def main():
-    config = load_config()
-    host = config["master"]["host"]
-    port = config["master"]["port"]
+    # --- IP / port du master demandés à l'utilisateur ---
+    host = input("Adresse IP du MASTER (ex: 0.0.0.0) : ").strip() or "0.0.0.0"
+    port_str = input("Port du MASTER (ex: 5000) : ").strip() or "5000"
+    port = int(port_str)
 
     # state partagé entre les threads
     state = {
-        "config": config,
-        # id_routeur -> {"n": ..., "e": ...}
+        # id_routeur -> {id, host, port, public_key}
         "routers": {}
     }
 
