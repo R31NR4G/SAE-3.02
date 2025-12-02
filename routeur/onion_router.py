@@ -18,6 +18,36 @@ DOSSIER_LOGS.mkdir(exist_ok=True)
 
 TAILLE_MSG_MAX = 8192
 
+# Fichier de topo texte maison
+CONFIG_NOEUDS = PROJET_RACINE / "config" / "noeuds.txt"
+
+
+def charger_config_noeud(noeud_id: str) -> tuple[str, int]:
+    """
+    Lit config/noeuds.txt et renvoie (ip, port) pour l'id donné.
+    Format de chaque ligne :
+        ID;IP;PORT
+    Lignes vides ou commençant par # sont ignorées.
+    """
+    try:
+        with CONFIG_NOEUDS.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(";")
+                if len(parts) != 3:
+                    continue
+                nid, host, port_str = (p.strip() for p in parts)
+                if nid.upper() == noeud_id.upper():
+                    return host, int(port_str)
+    except FileNotFoundError:
+        raise RuntimeError(f"Fichier de configuration {CONFIG_NOEUDS} introuvable")
+
+    raise RuntimeError(
+        f"Configuration pour le noeud {noeud_id} introuvable dans {CONFIG_NOEUDS}"
+    )
+
 
 def journaliser_evenement(routeur_id: int, niveau: str, evenement: str, **infos):
     """
@@ -170,19 +200,17 @@ def handle_onion(conn: socket.socket, addr, private_key: PrivateKey, routeur_id:
 
 
 def main():
-    # ID du routeur
+    # ID du routeur (entier : 1,2,3...)
     if len(sys.argv) >= 2:
         router_id = int(sys.argv[1])
     else:
         router_id = int(input("Id du routeur : ").strip())
 
-    # Adresse locale
-    r_host = input("Adresse IP locale du routeur : ").strip() or "127.0.0.1"
-    r_port = int(input("Port local du routeur : ").strip() or "6000")
+    # Adresse locale du routeur R<id> lue dans noeuds.txt
+    r_host, r_port = charger_config_noeud(f"R{router_id}")
 
-    # Adresse du master
-    master_h = input("Adresse IP du MASTER : ").strip() or "127.0.0.1"
-    master_p = int(input("Port du MASTER : ").strip() or "5000")
+    # Adresse du master lue dans noeuds.txt
+    master_h, master_p = charger_config_noeud("MASTER")
 
     # Génération des clés RSA
     public_key, private_key = generate_keypair(bits=2048)
@@ -191,6 +219,7 @@ def main():
     print(f"[ROUTEUR {router_id}] Clé publique RSA générée.")
     print(f"  n = {n_pub}")
     print(f"  e = {e}")
+    print(f"[ROUTEUR {router_id}] Config : moi = {r_host}:{r_port}, master = {master_h}:{master_p}")
 
     # Enregistrement au master
     try:

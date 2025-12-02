@@ -17,6 +17,36 @@ DOSSIER_LOGS = PROJET_RACINE / "logs"
 DOSSIER_LOGS.mkdir(exist_ok=True)
 TAILLE_MSG_MAX = 4096
 
+# Fichier de topo texte maison
+CONFIG_NOEUDS = PROJET_RACINE / "config" / "noeuds.txt"
+
+
+def charger_config_noeud(noeud_id: str) -> tuple[str, int]:
+    """
+    Lit config/noeuds.txt et renvoie (ip, port) pour l'id donné.
+    Format de chaque ligne :
+        ID;IP;PORT
+    Lignes vides ou commençant par # sont ignorées.
+    """
+    try:
+        with CONFIG_NOEUDS.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(";")
+                if len(parts) != 3:
+                    continue
+                nid, host, port_str = (p.strip() for p in parts)
+                if nid.upper() == noeud_id.upper():
+                    return host, int(port_str)
+    except FileNotFoundError:
+        raise RuntimeError(f"Fichier de configuration {CONFIG_NOEUDS} introuvable")
+
+    raise RuntimeError(
+        f"Configuration pour le noeud {noeud_id} introuvable dans {CONFIG_NOEUDS}"
+    )
+
 
 def journaliser_evenement(client_id: str, niveau: str, evenement: str, **infos):
     fichier_log = DOSSIER_LOGS / f"client_{client_id}.log"
@@ -160,6 +190,48 @@ def get_router_info_from_master(master_h: str, master_p: int, my_id: str):
     return info["routers"]
 
 
+def demander_nb_routeurs(total: int, actuel: int | None) -> int:
+    """
+    Demande à l'utilisateur combien de routeurs il veut utiliser.
+    - minimum 3
+    - maximum = total
+    - si 'actuel' n'est pas None, Enter permet de garder la valeur actuelle.
+    """
+    if total < 3:
+        raise RuntimeError("Il faut au moins 3 routeurs actifs pour respecter le minimum de 3.")
+
+    while True:
+        if actuel is None:
+            prompt = f"Nombre de routeurs à utiliser (min 3, max {total}) : "
+        else:
+            prompt = (
+                f"Nombre de routeurs à utiliser (min 3, max {total}, "
+                f"Entrée = garder {actuel}) : "
+            )
+
+        s = input(prompt).strip()
+
+        if not s:
+            if actuel is not None:
+                return actuel
+            else:
+                print("Veuillez entrer un nombre.")
+                continue
+
+        try:
+            val = int(s)
+        except ValueError:
+            print("Veuillez entrer un nombre entier.")
+            continue
+
+        if val < 3:
+            print("Le minimum est 3.")
+        elif val > total:
+            print("Vous ne pouvez pas dépasser le nombre total de routeurs actifs.")
+        else:
+            return val
+
+
 def main():
     # ID du client
     if len(sys.argv) >= 2:
@@ -167,47 +239,29 @@ def main():
     else:
         my_id = input("Id du client (A,B,...) : ").strip().upper()
 
-    # Adresse locale
-    listen_host = input("Adresse IP locale de ce client : ").strip() or "127.0.0.1"
-    listen_port_str = input("Port d'écoute local de ce client : ").strip() or "7000"
-    listen_port = int(listen_port_str)
+    # Adresse locale du client lue dans noeuds.txt
+    listen_host, listen_port = charger_config_noeud(my_id)
 
     journaliser_evenement(
         my_id, "INFO", "client_demarre",
         host=listen_host, port=listen_port,
     )
 
-    # Adresse du master
-    master_h = input("Adresse IP du MASTER : ").strip() or "127.0.0.1"
-    master_p_str = input("Port du MASTER : ").strip() or "5000"
-    master_p = int(master_p_str)
+    # Adresse du master lue dans noeuds.txt
+    master_h, master_p = charger_config_noeud("MASTER")
 
-    # Thread écoute
+    # Thread écoute pour recevoir les messages finaux
     threading.Thread(
         target=listen_incoming,
         args=(my_id, listen_host, listen_port),
         daemon=True
     ).start()
 
-    # Récupération des routeurs
-    try:
-        routers = get_router_info_from_master(master_h, master_p, my_id)
-    except Exception as e:
-        print("[CLIENT] Impossible de récupérer la liste des routeurs :", e)
-        return
+    # Cache pour mémoriser les infos des autres clients
+    dest_infos: dict[str, tuple[str, int]] = {}
 
-    routers = [r for r in routers if r.get("public_key") is not None]
-
-    if len(routers) < 1:
-        print("[CLIENT] Il faut au moins 1 routeur actif !")
-        journaliser_evenement(
-            my_id, "ERREUR", "nombre_routeurs_insuffisant",
-            nb_routeurs=len(routers),
-        )
-        return
-
-    # Dictionnaire local pour mémoriser les autres clients
-    dest_infos = {}
+    # nb_hops courant (None au début → l'utilisateur devra saisir un nombre une 1ère fois)
+    nb_hops: int | None = None
 
     print(f"[CLIENT {my_id}] Prêt. Format : DEST: message (ex: B: salut)")
 
@@ -225,40 +279,55 @@ def main():
         dest_id = dest_id.strip().upper()
         msg = msg.strip()
 
-        # Adresse du destinataire (mémorisée après la 1re fois)
+        # 1) On récupère A CHAQUE FOIS la liste des routeurs auprès du master
+        try:
+            routers = get_router_info_from_master(master_h, master_p, my_id)
+        except Exception as e:
+            print("[CLIENT] Impossible de récupérer la liste des routeurs :", e)
+            continue
+
+        routers = [r for r in routers if r.get("public_key") is not None]
+
+        if len(routers) < 3:
+            print("[CLIENT] Il faut au moins 3 routeurs actifs !")
+            journaliser_evenement(
+                my_id, "ERREUR", "nombre_routeurs_insuffisant",
+                nb_routeurs=len(routers),
+            )
+            continue
+
+        # 2) L'utilisateur peut ajuster le nombre de routeurs maintenant
+        nb_hops = demander_nb_routeurs(len(routers), nb_hops)
+        print(f"[CLIENT {my_id}] Le chemin utilisera {nb_hops} routeurs pour ce message.")
+
+        # 3) Adresse du destinataire : lue une seule fois depuis noeuds.txt puis mise en cache
         if dest_id not in dest_infos:
-            dh = input(f"Adresse IP de {dest_id} : ").strip() or "127.0.0.1"
-            dp_str = input(f"Port d'écoute de {dest_id} : ").strip() or "7000"
-            dp = int(dp_str)
-            dest_infos[dest_id] = (dh, dp)
+            dest_host, dest_port = charger_config_noeud(dest_id)
+            dest_infos[dest_id] = (dest_host, dest_port)
             journaliser_evenement(
                 my_id, "INFO", "destinataire_enregistre_localement",
-                destinataire_id=dest_id, host=dh, port=dp,
+                destinataire_id=dest_id, host=dest_host, port=dest_port,
             )
 
         dest_host, dest_port = dest_infos[dest_id]
 
-        # === NOUVEAU : on prend TOUS les routeurs, mais dans un ordre aléatoire ===
-        path = routers[:]      # copie
-        random.shuffle(path)   # on mélange, mais on ne coupe pas
+        # 4) Choix aléatoire nb_hops routeurs parmi la liste
+        path = random.sample(routers, nb_hops)
 
-        # affichage du chemin (tous les routeurs utilisés)
         chain_str = " → ".join(f"R{r['id']}" for r in path)
         print(f"[CLIENT {my_id}] Chemin choisi : {chain_str}")
         journaliser_evenement(
             my_id, "INFO", "chemin_construit", chemin=chain_str,
         )
 
-        # Clés publiques
+        # 5) Clés publiques
         def to_pubkey(r) -> PublicKey:
             pk = r["public_key"]
             return pk["n"], pk["e"]
 
         pubkeys = [to_pubkey(r) for r in path]
 
-        # ==========================================================
-        # Construction de l'oignon avec N routeurs (N = len(path))
-        # ==========================================================
+        # 6) Construction de l'oignon
         # Dernière couche : vers le client final
         inner = {
             "dest_host": dest_host,
@@ -269,8 +338,7 @@ def main():
         }
         cipher = encrypt_str(json.dumps(inner), pubkeys[-1])
 
-        # Couches intermédiaires : on remonte la chaîne à l'envers
-        # path[i] enverra vers path[i+1]
+        # Couches intermédiaires (routeurs intermédiaires)
         for i in range(len(path) - 2, -1, -1):
             layer = {
                 "next_host": path[i + 1]["host"],
@@ -279,7 +347,7 @@ def main():
             }
             cipher = encrypt_str(json.dumps(layer), pubkeys[i])
 
-        # cipher = couche d'entrée (C1) pour le premier routeur
+        # cipher = couche d'entrée pour le premier routeur
         try:
             first = path[0]
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

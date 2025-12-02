@@ -13,6 +13,36 @@ DOSSIER_LOGS = PROJET_RACINE / "logs"
 DOSSIER_LOGS.mkdir(exist_ok=True)
 FICHIER_LOG = DOSSIER_LOGS / "master.log"
 
+# Fichier de topo texte maison
+CONFIG_NOEUDS = PROJET_RACINE / "config" / "noeuds.txt"
+
+
+def charger_config_noeud(noeud_id: str) -> tuple[str, int]:
+    """
+    Lit config/noeuds.txt et renvoie (ip, port) pour l'id donné.
+    Format de chaque ligne :
+        ID;IP;PORT
+    Lignes vides ou commençant par # sont ignorées.
+    """
+    try:
+        with CONFIG_NOEUDS.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(";")
+                if len(parts) != 3:
+                    continue
+                nid, host, port_str = (p.strip() for p in parts)
+                if nid.upper() == noeud_id.upper():
+                    return host, int(port_str)
+    except FileNotFoundError:
+        raise RuntimeError(f"Fichier de configuration {CONFIG_NOEUDS} introuvable")
+
+    raise RuntimeError(
+        f"Configuration pour le noeud {noeud_id} introuvable dans {CONFIG_NOEUDS}"
+    )
+
 
 def journaliser_evenement(niveau: str, evenement: str, **infos):
     """
@@ -203,10 +233,8 @@ def handle_connection(conn: socket.socket, addr, state: dict):
 
 
 def main():
-    # --- IP / port du master demandés à l'utilisateur ---
-    host = input("Adresse IP du MASTER (ex: 0.0.0.0) : ").strip() or "0.0.0.0"
-    port_str = input("Port du MASTER (ex: 5000) : ").strip() or "5000"
-    port = int(port_str)
+    # IP / port du master lus dans le fichier texte maison
+    host, port = charger_config_noeud("MASTER")
 
     # state partagé entre les threads
     state = {
