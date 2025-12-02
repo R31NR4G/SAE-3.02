@@ -1,369 +1,245 @@
-import json
 import socket
+import struct
 import threading
-from pathlib import Path
 import sys
 import random
-import time
+from pathlib import Path
 
-# Permet d'importer crypto.onion_rsa depuis ce script
-PROJET_RACINE = Path(__file__).parents[1]
-if str(PROJET_RACINE) not in sys.path:
-    sys.path.insert(0, str(PROJET_RACINE))
+from crypto.onion_rsa import encrypt_str
 
-from crypto.onion_rsa import encrypt_str, PublicKey
+CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
-DOSSIER_LOGS = PROJET_RACINE / "logs"
-DOSSIER_LOGS.mkdir(exist_ok=True)
-TAILLE_MSG_MAX = 4096
+# -----------------------------------------------------
+# OUTILS GÉNÉRAUX
+# -----------------------------------------------------
 
-# Fichier de topo texte maison
-CONFIG_NOEUDS = PROJET_RACINE / "config" / "noeuds.txt"
+def load_node(node_id: str):
+    """Lit config/noeuds.txt → (host, port)."""
+    with CONFIG.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
 
+            nid, host, port = line.split(";")
+            if nid.upper() == node_id.upper():
+                return host, int(port)
 
-def charger_config_noeud(noeud_id: str) -> tuple[str, int]:
-    """
-    Lit config/noeuds.txt et renvoie (ip, port) pour l'id donné.
-    Format de chaque ligne :
-        ID;IP;PORT
-    Lignes vides ou commençant par # sont ignorées.
-    """
-    try:
-        with CONFIG_NOEUDS.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split(";")
-                if len(parts) != 3:
-                    continue
-                nid, host, port_str = (p.strip() for p in parts)
-                if nid.upper() == noeud_id.upper():
-                    return host, int(port_str)
-    except FileNotFoundError:
-        raise RuntimeError(f"Fichier de configuration {CONFIG_NOEUDS} introuvable")
-
-    raise RuntimeError(
-        f"Configuration pour le noeud {noeud_id} introuvable dans {CONFIG_NOEUDS}"
-    )
+    raise RuntimeError(f"Noeud {node_id} introuvable.")
 
 
-def journaliser_evenement(client_id: str, niveau: str, evenement: str, **infos):
-    fichier_log = DOSSIER_LOGS / f"client_{client_id}.log"
-    entree = {
-        "instant": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "niveau": niveau,
-        "evenement": evenement,
-        "client_id": client_id,
-        **infos
-    }
-    try:
-        ligne = json.dumps(entree, ensure_ascii=False)
-    except TypeError:
-        entree_str = {k: str(v) for k, v in entree.items()}
-        ligne = json.dumps(entree_str, ensure_ascii=False)
-
-    try:
-        with fichier_log.open("a", encoding="utf-8") as f:
-            f.write(ligne + "\n")
-    except OSError:
-        pass
+def send_packet(sock: socket.socket, payload: str):
+    """Envoie [4 octets longueur] + [payload en UTF-8]."""
+    data = payload.encode()
+    sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-def envoyer_json(sock: socket.socket, obj: dict, client_id: str) -> bool:
-    try:
-        data = json.dumps(obj) + "\n"
-    except (TypeError, ValueError) as e:
-        journaliser_evenement(
-            client_id, "ERREUR", "json_non_serialisable",
-            erreur=str(e), objet=str(obj),
-        )
-        return False
+def recv_packet(sock: socket.socket):
+    """Reçoit un paquet complet."""
+    header = sock.recv(4)
+    if len(header) < 4:
+        return None
 
-    try:
-        sock.sendall(data.encode("utf-8"))
-        return True
-    except OSError as e:
-        journaliser_evenement(
-            client_id, "ERREUR", "envoi_json_echec", erreur=str(e),
-        )
-        return False
+    size = struct.unpack(">I", header)[0]
+    if size <= 0 or size > 16384:
+        return None
 
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            return None
+        data += chunk
 
-def handle_delivery(conn: socket.socket, addr, my_id: str):
-    try:
-        f = conn.makefile("r", encoding="utf-8")
-        line = f.readline()
-        if not line:
-            journaliser_evenement(
-                my_id, "AVERTISSEMENT", "ligne_vide_reception",
-                adresse=str(addr),
-            )
-            return
-
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError as e:
-            journaliser_evenement(
-                my_id, "AVERTISSEMENT", "json_invalide_reception",
-                adresse=str(addr), erreur=str(e),
-                ligne=line[:TAILLE_MSG_MAX],
-            )
-            print("[CLIENT] Message JSON invalide reçu :", e)
-            return
-
-        if msg.get("type") != "deliver_message":
-            journaliser_evenement(
-                my_id, "AVERTISSEMENT", "type_message_inattendu",
-                type_message=msg.get("type"), contenu=str(msg),
-            )
-            print("[CLIENT] Message inconnu :", msg)
-            return
-
-        src = msg.get("from_id")
-        text = msg.get("message")
-        journaliser_evenement(
-            my_id, "INFO", "message_recu", expediteur_id=src,
-        )
-        print(f"\n[CLIENT {my_id}] Message de {src} : {text}")
-        print("> ", end="", flush=True)
-    finally:
-        try:
-            conn.close()
-        except OSError:
-            pass
+    return data.decode(errors="ignore")
 
 
-def listen_incoming(my_id: str, host: str, port: int):
-    ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.bind((host, port))
-    ls.listen()
-    journaliser_evenement(
-        my_id, "INFO", "client_en_ecoute",
-        host=host, port=port,
-    )
+# -----------------------------------------------------
+# Écoute des messages finaux (DELIVER) côté client
+# -----------------------------------------------------
+
+def listen_incoming(my_id, host, port):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port))
+    s.listen()
     print(f"[CLIENT {my_id}] En écoute sur {host}:{port}")
 
     while True:
-        try:
-            conn, addr = ls.accept()
-        except OSError as e:
-            journaliser_evenement(
-                my_id, "ERREUR", "erreur_accept", erreur=str(e),
-            )
-            print(f"[CLIENT {my_id}] Erreur sur accept() :", e)
-            break
+        conn, addr = s.accept()
+        pkt = recv_packet(conn)
+        conn.close()
 
-        threading.Thread(
-            target=handle_delivery,
-            args=(conn, addr, my_id),
-            daemon=True
-        ).start()
+        if not pkt:
+            continue
+
+        if pkt.startswith("DELIVER|"):
+            _, from_id, message = pkt.split("|", 2)
+            print(f"\n[CLIENT {my_id}] Message de {from_id} : {message}")
+            print("> ", end="", flush=True)
 
 
-def get_router_info_from_master(master_h: str, master_p: int, my_id: str):
+# -----------------------------------------------------
+# Récupération des routeurs auprès du master
+# -----------------------------------------------------
+
+def get_routers(master_h, master_p):
+    """
+    Retourne une liste :
+    [
+        (rid, host, port, n, e),
+        ...
+    ]
+    """
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((master_h, master_p))
-            envoyer_json(s, {"type": "router_info_request"}, my_id)
-            f = s.makefile("r", encoding="utf-8")
-            line = f.readline()
-            if not line:
-                raise ValueError("Réponse vide du master")
+        s = socket.socket()
+        s.connect((master_h, master_p))
+        send_packet(s, "ROUTER_INFO_REQUEST")
+        resp = recv_packet(s)
+        s.close()
 
-            info = json.loads(line)
-    except (OSError, json.JSONDecodeError, ValueError) as e:
-        journaliser_evenement(
-            my_id, "ERREUR", "echec_recuperation_routeurs_master",
-            master=f"{master_h}:{master_p}", erreur=str(e),
-        )
-        raise
+        if not resp or not resp.startswith("ROUTER_INFO|"):
+            return []
 
-    if info.get("type") != "router_info":
-        journaliser_evenement(
-            my_id, "ERREUR", "type_reponse_inattendu_master",
-            reponse=str(info),
-        )
-        raise ValueError("Master → réponse invalide")
+        data = resp.split("|", 1)[1]
+        routers = []
 
-    return info["routers"]
+        for item in data.split(";"):
+            if not item:
+                continue
 
+            rid, h, p, n, e = item.split(",")
+            routers.append((rid, h, int(p), int(n), int(e)))
+
+        return routers
+
+    except:
+        return []
+
+
+# -----------------------------------------------------
+# Choix dynamique du nombre de routeurs
+# -----------------------------------------------------
 
 def demander_nb_routeurs(total: int, actuel: int | None) -> int:
     """
-    Demande à l'utilisateur combien de routeurs il veut utiliser.
-    - minimum 3
-    - maximum = total
-    - si 'actuel' n'est pas None, Enter permet de garder la valeur actuelle.
+    Demande à l'utilisateur combien de routeurs utiliser :
+    - min = 3
+    - max = total (routeurs actifs)
+    - Enter = garder valeur précédente
     """
     if total < 3:
-        raise RuntimeError("Il faut au moins 3 routeurs actifs pour respecter le minimum de 3.")
+        raise RuntimeError("Il faut au moins 3 routeurs actifs.")
 
     while True:
         if actuel is None:
-            prompt = f"Nombre de routeurs à utiliser (min 3, max {total}) : "
+            prompt = f"Nombre de routeurs (min 3, max {total}) : "
         else:
-            prompt = (
-                f"Nombre de routeurs à utiliser (min 3, max {total}, "
-                f"Entrée = garder {actuel}) : "
-            )
+            prompt = f"Nombre de routeurs (min 3, max {total}, Entrée = {actuel}) : "
 
         s = input(prompt).strip()
 
         if not s:
             if actuel is not None:
                 return actuel
-            else:
-                print("Veuillez entrer un nombre.")
-                continue
+            print("Veuillez entrer un nombre.")
+            continue
 
         try:
             val = int(s)
         except ValueError:
-            print("Veuillez entrer un nombre entier.")
+            print("Entrez un nombre.")
             continue
 
         if val < 3:
-            print("Le minimum est 3.")
+            print("Minimum = 3.")
         elif val > total:
-            print("Vous ne pouvez pas dépasser le nombre total de routeurs actifs.")
+            print(f"Maximum = {total}.")
         else:
             return val
 
 
+# -----------------------------------------------------
+# CLIENT PRINCIPAL
+# -----------------------------------------------------
+
 def main():
     # ID du client
     if len(sys.argv) >= 2:
-        my_id = sys.argv[1].upper()
+        cid = sys.argv[1].upper()
     else:
-        my_id = input("Id du client (A,B,...) : ").strip().upper()
+        cid = input("Id client (A,B,C...) : ").upper()
 
-    # Adresse locale du client lue dans noeuds.txt
-    listen_host, listen_port = charger_config_noeud(my_id)
+    # Adresse du client
+    c_host, c_port = load_node(cid)
 
-    journaliser_evenement(
-        my_id, "INFO", "client_demarre",
-        host=listen_host, port=listen_port,
-    )
-
-    # Adresse du master lue dans noeuds.txt
-    master_h, master_p = charger_config_noeud("MASTER")
-
-    # Thread écoute pour recevoir les messages finaux
+    # Thread écoute des messages entrants
     threading.Thread(
         target=listen_incoming,
-        args=(my_id, listen_host, listen_port),
+        args=(cid, c_host, c_port),
         daemon=True
     ).start()
 
-    # Cache pour mémoriser les infos des autres clients
-    dest_infos: dict[str, tuple[str, int]] = {}
+    # Adresse du master
+    master_h, master_p = load_node("MASTER")
 
-    # nb_hops courant (None au début → l'utilisateur devra saisir un nombre une 1ère fois)
-    nb_hops: int | None = None
+    # Cache de nombre de routeurs
+    nb_hops = None
 
-    print(f"[CLIENT {my_id}] Prêt. Format : DEST: message (ex: B: salut)")
+    print(f"[CLIENT {cid}] Prêt. Format message : DEST: texte")
 
     while True:
-        txt = input("> ").strip()
-        if txt.lower() in ("bye", "quit", "exit"):
-            journaliser_evenement(my_id, "INFO", "commande_sortie")
-            break
-
-        if ":" not in txt:
-            print("Format invalide. Utilise DEST: message")
+        line = input("> ").strip()
+        if not line or ":" not in line:
             continue
 
-        dest_id, msg = txt.split(":", 1)
-        dest_id = dest_id.strip().upper()
-        msg = msg.strip()
+        dest, message = line.split(":", 1)
+        dest = dest.strip().upper()
+        message = message.strip()
 
-        # 1) On récupère A CHAQUE FOIS la liste des routeurs auprès du master
-        try:
-            routers = get_router_info_from_master(master_h, master_p, my_id)
-        except Exception as e:
-            print("[CLIENT] Impossible de récupérer la liste des routeurs :", e)
+        if not message:
             continue
 
-        routers = [r for r in routers if r.get("public_key") is not None]
+        # Adresse du destinataire
+        d_host, d_port = load_node(dest)
 
+        # Liste des routeurs
+        routers = get_routers(master_h, master_p)
         if len(routers) < 3:
-            print("[CLIENT] Il faut au moins 3 routeurs actifs !")
-            journaliser_evenement(
-                my_id, "ERREUR", "nombre_routeurs_insuffisant",
-                nb_routeurs=len(routers),
-            )
+            print("[CLIENT] Pas assez de routeurs en ligne.")
             continue
 
-        # 2) L'utilisateur peut ajuster le nombre de routeurs maintenant
+        # Choix dynamique du nombre de routeurs
         nb_hops = demander_nb_routeurs(len(routers), nb_hops)
-        print(f"[CLIENT {my_id}] Le chemin utilisera {nb_hops} routeurs pour ce message.")
 
-        # 3) Adresse du destinataire : lue une seule fois depuis noeuds.txt puis mise en cache
-        if dest_id not in dest_infos:
-            dest_host, dest_port = charger_config_noeud(dest_id)
-            dest_infos[dest_id] = (dest_host, dest_port)
-            journaliser_evenement(
-                my_id, "INFO", "destinataire_enregistre_localement",
-                destinataire_id=dest_id, host=dest_host, port=dest_port,
-            )
-
-        dest_host, dest_port = dest_infos[dest_id]
-
-        # 4) Choix aléatoire nb_hops routeurs parmi la liste
+        # Chemin aléatoire
         path = random.sample(routers, nb_hops)
+        print(f"[CLIENT {cid}] Chemin : {[r[0] for r in path]}")
 
-        chain_str = " → ".join(f"R{r['id']}" for r in path)
-        print(f"[CLIENT {my_id}] Chemin choisi : {chain_str}")
-        journaliser_evenement(
-            my_id, "INFO", "chemin_construit", chemin=chain_str,
-        )
+        # Construction de l'oignon
+        # Dernière couche
+        plain = f"{d_host}|{d_port}|{cid}|{message}"
+        cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
 
-        # 5) Clés publiques
-        def to_pubkey(r) -> PublicKey:
-            pk = r["public_key"]
-            return pk["n"], pk["e"]
+        # Couches intermédiaires
+        for i in range(nb_hops - 2, -1, -1):
+            next_h = path[i + 1][1]
+            next_p = path[i + 1][2]
+            layer = f"{next_h}|{next_p}|{cipher}"
+            cipher = encrypt_str(layer, (path[i][3], path[i][4]))
 
-        pubkeys = [to_pubkey(r) for r in path]
+        # Envoi au premier routeur
+        entry = path[0]
 
-        # 6) Construction de l'oignon
-        # Dernière couche : vers le client final
-        inner = {
-            "dest_host": dest_host,
-            "dest_port": dest_port,
-            "from_id": my_id,
-            "to_id": dest_id,
-            "message": msg
-        }
-        cipher = encrypt_str(json.dumps(inner), pubkeys[-1])
-
-        # Couches intermédiaires (routeurs intermédiaires)
-        for i in range(len(path) - 2, -1, -1):
-            layer = {
-                "next_host": path[i + 1]["host"],
-                "next_port": path[i + 1]["port"],
-                "inner": cipher
-            }
-            cipher = encrypt_str(json.dumps(layer), pubkeys[i])
-
-        # cipher = couche d'entrée pour le premier routeur
         try:
-            first = path[0]
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((first["host"], first["port"]))
-                envoyer_json(s, {"type": "onion_packet", "cipher": cipher}, my_id)
-            print(f"[CLIENT {my_id}] Message envoyé via {chain_str}")
-            journaliser_evenement(
-                my_id, "INFO", "message_envoye",
-                destinataire_id=dest_id, chemin=chain_str,
-            )
+            s = socket.socket()
+            s.connect((entry[1], entry[2]))
+            send_packet(s, "ONION|" + cipher)
+            s.close()
+
+            print(f"[CLIENT {cid}] Message envoyé via {[r[0] for r in path]}")
         except Exception as e:
-            print(f"[CLIENT] Erreur d’envoi : {e}")
-            journaliser_evenement(
-                my_id, "ERREUR", "erreur_envoi_message",
-                destinataire_id=dest_id, erreur=str(e),
-            )
+            print("[CLIENT] Erreur d’envoi :", e)
 
 
 if __name__ == "__main__":

@@ -1,268 +1,157 @@
-import json
 import socket
+import struct
 import threading
-from pathlib import Path
 import sys
-import time
+from pathlib import Path
 
-# --- pour pouvoir importer crypto.onion_rsa même en lançant ce fichier directement ---
-PROJET_RACINE = Path(__file__).parents[1]
-if str(PROJET_RACINE) not in sys.path:
-    sys.path.insert(0, str(PROJET_RACINE))
+# RSA simplifié sans JSON
+from crypto.onion_rsa import generate_keypair, decrypt_str
 
-from crypto.onion_rsa import decrypt_str, generate_keypair, PrivateKey, PublicKey
+CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
-# Dossier de logs : <racine_projet>/logs/routeur_<id>.log
-DOSSIER_LOGS = PROJET_RACINE / "logs"
-DOSSIER_LOGS.mkdir(exist_ok=True)
+# -----------------------------------------------------
+# OUTILS
+# -----------------------------------------------------
 
-TAILLE_MSG_MAX = 8192
+def load_node(node_id: str):
+    with CONFIG.open() as f:
+        for line in f:
+            line=line.strip()
+            if not line or line.startswith("#"):
+                continue
+            nid, host, port = line.split(";")
+            if nid.upper()==node_id.upper():
+                return host, int(port)
+    raise RuntimeError(f"Noeud {node_id} introuvable.")
 
-# Fichier de topo texte maison
-CONFIG_NOEUDS = PROJET_RACINE / "config" / "noeuds.txt"
+def send_packet(sock: socket.socket, payload: str):
+    data = payload.encode()
+    sock.sendall(struct.pack(">I", len(data)) + data)
 
+def recv_packet(sock: socket.socket):
+    header = sock.recv(4)
+    if len(header)<4:
+        return None
+    size = struct.unpack(">I", header)[0]
+    if size<=0 or size>16384:
+        return None
+    data=b""
+    while len(data)<size:
+        chunk=sock.recv(size-len(data))
+        if not chunk:
+            return None
+        data+=chunk
+    return data.decode(errors="ignore")
 
-def charger_config_noeud(noeud_id: str) -> tuple[str, int]:
-    """
-    Lit config/noeuds.txt et renvoie (ip, port) pour l'id donné.
-    Format de chaque ligne :
-        ID;IP;PORT
-    Lignes vides ou commençant par # sont ignorées.
-    """
+# -----------------------------------------------------
+# ROUTEUR
+# -----------------------------------------------------
+
+def handle_onion(conn, addr, private_key, router_id):
     try:
-        with CONFIG_NOEUDS.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split(";")
-                if len(parts) != 3:
-                    continue
-                nid, host, port_str = (p.strip() for p in parts)
-                if nid.upper() == noeud_id.upper():
-                    return host, int(port_str)
-    except FileNotFoundError:
-        raise RuntimeError(f"Fichier de configuration {CONFIG_NOEUDS} introuvable")
-
-    raise RuntimeError(
-        f"Configuration pour le noeud {noeud_id} introuvable dans {CONFIG_NOEUDS}"
-    )
-
-
-def journaliser_evenement(routeur_id: int, niveau: str, evenement: str, **infos):
-    """
-    Log dédié au routeur.
-    Fichier : logs/routeur_<id>.log
-    """
-    fichier_log = DOSSIER_LOGS / f"routeur_{routeur_id}.log"
-    entree = {
-        "instant": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "niveau": niveau,
-        "evenement": evenement,
-        "routeur_id": routeur_id,
-        **infos
-    }
-    try:
-        ligne = json.dumps(entree, ensure_ascii=False)
-    except TypeError:
-        entree_str = {k: str(v) for k, v in entree.items()}
-        ligne = json.dumps(entree_str, ensure_ascii=False)
-
-    try:
-        with fichier_log.open("a", encoding="utf-8") as f:
-            f.write(ligne + "\n")
-    except OSError:
-        pass
-
-
-def envoyer_json(sock: socket.socket, obj: dict, routeur_id: int) -> bool:
-    """Envoie un objet JSON + \\n, avec journalisation en cas d'échec."""
-    try:
-        data = json.dumps(obj) + "\n"
-    except (TypeError, ValueError) as e:
-        journaliser_evenement(
-            routeur_id, "ERREUR", "json_non_serialisable",
-            erreur=str(e), objet=str(obj),
-        )
-        return False
-
-    try:
-        sock.sendall(data.encode("utf-8"))
-        return True
-    except OSError as e:
-        journaliser_evenement(
-            routeur_id, "ERREUR", "envoi_json_echec", erreur=str(e)
-        )
-        return False
-
-
-def valider_couche_routeur(inner: dict, routeur_id: int) -> bool:
-    """
-    Valide la structure d'une couche déchiffrée.
-    Retourne True si OK, False sinon.
-    """
-    # Cas : routeur intermédiaire
-    if "next_host" in inner:
-        champs = ["next_host", "next_port", "inner"]
-        for c in champs:
-            if c not in inner:
-                journaliser_evenement(
-                    routeur_id, "AVERTISSEMENT", "couche_incomplete",
-                    champ_manquant=c, contenu=str(inner)
-                )
-                return False
-        return True
-
-    # Cas : dernier routeur
-    champs_final = ["dest_host", "dest_port", "from_id", "to_id", "message"]
-    for c in champs_final:
-        if c not in inner:
-            journaliser_evenement(
-                routeur_id, "AVERTISSEMENT", "couche_finale_incomplete",
-                champ_manquant=c, contenu=str(inner)
-            )
-            return False
-    return True
-
-
-def forward_to(host: str, port: int, cipher: str, routeur_id: int):
-    """Forward le paquet au routeur suivant."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((host, port))
-            envoyer_json(s, {"type": "onion_packet", "cipher": cipher}, routeur_id)
-        journaliser_evenement(routeur_id, "INFO", "paquet_transfere",
-                              prochain_hop=f"{host}:{port}")
-    except OSError as e:
-        journaliser_evenement(routeur_id, "ERREUR",
-                              "echec_transfert_routeur_suivant",
-                              prochain_hop=f"{host}:{port}", erreur=str(e))
-
-
-def handle_onion(conn: socket.socket, addr, private_key: PrivateKey, routeur_id: int):
-    """Décapsule une couche d'oignon et route le paquet."""
-    journaliser_evenement(routeur_id, "INFO", "paquet_onion_recu",
-                          adresse=str(addr))
-    print(f"[ROUTEUR {routeur_id}] Paquet onion reçu de {addr}")
-
-    try:
-        f = conn.makefile("r", encoding="utf-8")
-        line = f.readline()
-        if not line:
+        pkt = recv_packet(conn)
+        if not pkt:
             return
 
-        msg = json.loads(line)
-        if msg.get("type") != "onion_packet":
+        if not pkt.startswith("ONION|"):
             return
 
-        cipher = msg.get("cipher")
-        if not isinstance(cipher, str):
-            return
+        cipher = pkt.split("|",1)[1]
 
-        # Déchiffrement RSA
-        inner_plain = decrypt_str(cipher, private_key)
-        inner = json.loads(inner_plain)
+        # Déchiffre la couche
+        plain = decrypt_str(cipher, private_key)
+        # Format intermédiaire :
+        # next_host|next_port|cipher_suivant
+        # Format final :
+        # dest_host|dest_port|from_id|message
 
-        if not valider_couche_routeur(inner, routeur_id):
-            return
-
-        # Routeur intermédiaire
-        if "next_host" in inner:
-            print(f"[ROUTEUR {routeur_id}] → Vers {inner['next_host']}:{inner['next_port']}")
-            forward_to(inner["next_host"], inner["next_port"], inner["inner"], routeur_id)
-
-        # Dernier routeur
-        else:
-            print(f"[ROUTEUR {routeur_id}] Dernier saut vers {inner['dest_host']}:{inner['dest_port']}")
+        parts = plain.split("|")
+        if len(parts)==3:
+            # couche intermédiaire
+            nh, np, inner = parts
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.connect((inner["dest_host"], inner["dest_port"]))
-                    envoyer_json(
-                        s,
-                        {
-                            "type": "deliver_message",
-                            "from_id": inner["from_id"],
-                            "to_id": inner["to_id"],
-                            "message": inner["message"]
-                        },
-                        routeur_id
-                    )
-            except OSError as e:
-                journaliser_evenement(routeur_id, "ERREUR",
-                                      "echec_connexion_client_final",
-                                      erreur=str(e))
+                np=int(np)
+            except:
+                print("[ROUTEUR] Port invalide.")
+                return
+            forward(router_id, nh, np, inner)
+
+        elif len(parts)==4:
+            # dernière couche
+            dh, dp, fid, msg = parts
+            try:
+                dp=int(dp)
+            except:
+                print("[ROUTEUR] Port dest invalide.")
+                return
+
+            deliver(router_id, dh, dp, fid, msg)
+
+        else:
+            print("[ROUTEUR] Couche invalide :", plain)
 
     finally:
-        try:
-            conn.close()
-        except OSError:
-            pass
+        conn.close()
+
+
+def forward(rid, host, port, cipher):
+    try:
+        s=socket.socket()
+        s.connect((host,port))
+        send_packet(s, "ONION|" + cipher)
+        s.close()
+        print(f"[ROUTEUR {rid}] Forward -> {host}:{port}")
+    except:
+        print(f"[ROUTEUR {rid}] Échec forward.")
+
+
+def deliver(rid, host, port, from_id, msg):
+    try:
+        s=socket.socket()
+        s.connect((host,port))
+        send_packet(s, f"DELIVER|{from_id}|{msg}")
+        s.close()
+        print(f"[ROUTEUR {rid}] Message livré -> {host}:{port}")
+    except:
+        print(f"[ROUTEUR {rid}] Échec livraison.")
 
 
 def main():
-    # ID du routeur (entier : 1,2,3...)
-    if len(sys.argv) >= 2:
-        router_id = int(sys.argv[1])
+    if len(sys.argv)>=2:
+        rid = sys.argv[1].upper()
     else:
-        router_id = int(input("Id du routeur : ").strip())
+        rid = input("Id routeur R1,R2... : ").upper()
 
-    # Adresse locale du routeur R<id> lue dans noeuds.txt
-    r_host, r_port = charger_config_noeud(f"R{router_id}")
+    r_host, r_port = load_node(rid)
+    m_host, m_port = load_node("MASTER")
 
-    # Adresse du master lue dans noeuds.txt
-    master_h, master_p = charger_config_noeud("MASTER")
+    # clés RSA
+    pub, priv = generate_keypair()
+    n,e = pub
 
-    # Génération des clés RSA
-    public_key, private_key = generate_keypair(bits=2048)
-    n_pub, e = public_key
-
-    print(f"[ROUTEUR {router_id}] Clé publique RSA générée.")
-    print(f"  n = {n_pub}")
-    print(f"  e = {e}")
-    print(f"[ROUTEUR {router_id}] Config : moi = {r_host}:{r_port}, master = {master_h}:{master_p}")
-
-    # Enregistrement au master
+    # enregistrement au master
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ms:
-            ms.connect((master_h, master_p))
-            envoyer_json(ms, {
-                "type": "router_register",
-                "router_id": router_id,
-                "host": r_host,
-                "port": r_port,
-                "public_key": {"n": n_pub, "e": e}
-            }, router_id)
-        print(f"[ROUTEUR {router_id}] Infos envoyées au master")
-    except Exception as e:
-        print(f"[ROUTEUR {router_id}] ERREUR envoi au master : {e}")
+        s=socket.socket()
+        s.connect((m_host,m_port))
+        msg=f"REGISTER|{rid}|{r_host}|{r_port}|{n}|{e}"
+        send_packet(s,msg)
+        s.close()
+    except:
+        print("[ROUTEUR] Impossible de s'inscrire au master.")
 
-    # Socket d'écoute
-    listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listen_sock.bind((r_host, r_port))
-    listen_sock.listen()
+    # écoute
+    serv = socket.socket()
+    serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1)
+    serv.bind((r_host,r_port))
+    serv.listen()
+    print(f"[ROUTEUR {rid}] En écoute sur {r_host}:{r_port}")
 
-    print(f"[ROUTEUR {router_id}] En écoute sur {r_host}:{r_port}")
-
-    try:
-        while True:
-            conn, addr = listen_sock.accept()
-            threading.Thread(
-                target=handle_onion,
-                args=(conn, addr, private_key, router_id),
-                daemon=True
-            ).start()
-
-    except KeyboardInterrupt:
-        print(f"\n[ROUTEUR {router_id}] Arrêt demandé (Ctrl+C)")
-
-    finally:
-        try:
-            listen_sock.close()
-        except OSError:
-            pass
-        print(f"[ROUTEUR {router_id}] Fermé.")
+    while True:
+        conn,addr=serv.accept()
+        threading.Thread(target=handle_onion,
+                         args=(conn,addr,priv,rid),
+                         daemon=True).start()
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
