@@ -1,11 +1,12 @@
 import socket
-import struct
 import threading
 from pathlib import Path
 
 from database.onion_bdd import (
     add_router,
-    get_routers
+    get_routers,
+    reset_routers,
+    reset_routing_table
 )
 
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
@@ -20,30 +21,35 @@ def load_node(node_id: str):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-
             nid, host, port = line.split(";")
             if nid.upper() == node_id.upper():
                 return host, int(port)
-
     raise RuntimeError(f"Noeud {node_id} introuvable.")
 
 
 # -----------------------------------------------------
-# PROTOCOLE DE COMMUNICATION
+# PROTOCOLE ASCII LENGTH
 # -----------------------------------------------------
 def send_packet(sock: socket.socket, payload: str):
     data = payload.encode()
-    header = struct.pack(">I", len(data))
+    header = str(len(data)).encode() + b"\n"
     sock.sendall(header + data)
 
 
 def recv_packet(sock: socket.socket):
-    header = sock.recv(4)
-    if len(header) < 4:
+    size_bytes = b""
+    while not size_bytes.endswith(b"\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            return None
+        size_bytes += chunk
+
+    try:
+        size = int(size_bytes.strip())
+    except:
         return None
 
-    size = struct.unpack(">I", header)[0]
-    if size <= 0 or size > 4096:
+    if size <= 0 or size > 20000:
         return None
 
     data = b""
@@ -57,7 +63,7 @@ def recv_packet(sock: socket.socket):
 
 
 # -----------------------------------------------------
-# TRAITEMENT DES CLIENTS ET ROUTEURS
+# TRAITEMENT CLIENTS ET ROUTEURS
 # -----------------------------------------------------
 def handle_client(conn, addr):
     try:
@@ -66,34 +72,24 @@ def handle_client(conn, addr):
             if not pkt:
                 break
 
-            # ----------------------
-            # 1. Client demande la liste des routeurs
-            # ----------------------
+            # CLIENT → demande liste des routeurs
             if pkt == "ROUTER_INFO_REQUEST":
-                routers = get_routers()  # Depuis la BDD !
+                routers = get_routers()
 
-                # Format envoyé au client :
-                # ROUTER_INFO|R1,ip,port,n,e;R2,ip,port,n,e;...
                 parts = []
                 for rid, host, port, pub in routers:
-                    # pub = "n,e"
                     n, e = pub.split(",")
                     parts.append(f"{rid},{host},{port},{n},{e}")
 
                 resp = "ROUTER_INFO|" + ";".join(parts)
                 send_packet(conn, resp)
 
-            # ----------------------
-            # 2. Un routeur s’enregistre
-            # ----------------------
+            # ROUTEUR → REGISTER
             elif pkt.startswith("REGISTER|"):
-                # REGISTER|R1|host|port|n|e
                 _, rid, h, p, n, e = pkt.split("|")
                 pub = f"{n},{e}"
 
-                # On enregistre en BDD
                 add_router(rid, h, int(p), pub)
-
                 print(f"[MASTER] Routeur {rid} enregistré en BDD.")
 
             else:
@@ -109,6 +105,10 @@ def handle_client(conn, addr):
 # -----------------------------------------------------
 def main():
     host, port = load_node("MASTER")
+
+    # ⚠️ RESET des deux tables important
+    reset_routers()
+    reset_routing_table()
 
     serv = socket.socket()
     serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

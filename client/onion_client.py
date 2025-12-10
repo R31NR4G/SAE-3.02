@@ -1,5 +1,4 @@
 import socket
-import struct
 import threading
 import sys
 import random
@@ -10,38 +9,43 @@ from crypto.onion_rsa import encrypt_str
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
 # -----------------------------------------------------
-# OUTILS GÉNÉRAUX
+# OUTILS
 # -----------------------------------------------------
 
-def load_node(node_id: str):
-    """Lit config/noeuds.txt → (host, port)."""
+def load_node(node_id):
     with CONFIG.open() as f:
         for line in f:
-            line = line.strip()
+            line=line.strip()
             if not line or line.startswith("#"):
                 continue
-
             nid, host, port = line.split(";")
-            if nid.upper() == node_id.upper():
+            if nid.upper()==node_id.upper():
                 return host, int(port)
-
     raise RuntimeError(f"Noeud {node_id} introuvable.")
 
 
-def send_packet(sock: socket.socket, payload: str):
-    """Envoie [4 octets longueur] + [payload en UTF-8]."""
+def send_packet(sock, payload):
+    """Envoie taille ASCII + \n + payload."""
     data = payload.encode()
-    sock.sendall(struct.pack(">I", len(data)) + data)
+    header = str(len(data)).encode() + b"\n"
+    sock.sendall(header + data)
 
 
-def recv_packet(sock: socket.socket):
-    """Reçoit un paquet complet."""
-    header = sock.recv(4)
-    if len(header) < 4:
+def recv_packet(sock):
+    """Reçoit paquet : taille ASCII sur une ligne puis payload."""
+    size_bytes = b""
+    while not size_bytes.endswith(b"\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            return None
+        size_bytes += chunk
+
+    try:
+        size = int(size_bytes.strip())
+    except:
         return None
 
-    size = struct.unpack(">I", header)[0]
-    if size <= 0 or size > 16384:
+    if size <= 0 or size > 20000:
         return None
 
     data = b""
@@ -55,42 +59,33 @@ def recv_packet(sock: socket.socket):
 
 
 # -----------------------------------------------------
-# Écoute des messages finaux (DELIVER) côté client
+# RÉCEPTION DES MESSAGES
 # -----------------------------------------------------
 
 def listen_incoming(my_id, host, port):
     s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1)
     s.bind((host, port))
     s.listen()
+
     print(f"[CLIENT {my_id}] En écoute sur {host}:{port}")
 
     while True:
-        conn, addr = s.accept()
+        conn,addr = s.accept()
         pkt = recv_packet(conn)
         conn.close()
 
-        if not pkt:
-            continue
-
-        if pkt.startswith("DELIVER|"):
-            _, from_id, message = pkt.split("|", 2)
-            print(f"\n[CLIENT {my_id}] Message de {from_id} : {message}")
+        if pkt and pkt.startswith("DELIVER|"):
+            _, fid, msg = pkt.split("|",2)
+            print(f"\n[CLIENT {my_id}] Message de {fid} : {msg}")
             print("> ", end="", flush=True)
 
 
 # -----------------------------------------------------
-# Récupération des routeurs auprès du master
+# MASTER → liste des routeurs
 # -----------------------------------------------------
 
 def get_routers(master_h, master_p):
-    """
-    Retourne une liste :
-    [
-        (rid, host, port, n, e),
-        ...
-    ]
-    """
     try:
         s = socket.socket()
         s.connect((master_h, master_p))
@@ -101,13 +96,12 @@ def get_routers(master_h, master_p):
         if not resp or not resp.startswith("ROUTER_INFO|"):
             return []
 
-        data = resp.split("|", 1)[1]
+        data = resp.split("|",1)[1]
         routers = []
 
         for item in data.split(";"):
             if not item:
                 continue
-
             rid, h, p, n, e = item.split(",")
             routers.append((rid, h, int(p), int(n), int(e)))
 
@@ -118,18 +112,12 @@ def get_routers(master_h, master_p):
 
 
 # -----------------------------------------------------
-# Choix dynamique du nombre de routeurs
+# SELECTION NOMBRE DE ROUTEURS
 # -----------------------------------------------------
 
-def demander_nb_routeurs(total: int, actuel: int | None) -> int:
-    """
-    Demande à l'utilisateur combien de routeurs utiliser :
-    - min = 3
-    - max = total (routeurs actifs)
-    - Enter = garder valeur précédente
-    """
+def demander_nb_routeurs(total, actuel):
     if total < 3:
-        raise RuntimeError("Il faut au moins 3 routeurs actifs.")
+        raise RuntimeError("Il faut au moins 3 routeurs.")
 
     while True:
         if actuel is None:
@@ -146,17 +134,17 @@ def demander_nb_routeurs(total: int, actuel: int | None) -> int:
             continue
 
         try:
-            val = int(s)
-        except ValueError:
-            print("Entrez un nombre.")
+            n = int(s)
+        except:
+            print("Entrez un nombre entier.")
             continue
 
-        if val < 3:
+        if n < 3:
             print("Minimum = 3.")
-        elif val > total:
+        elif n > total:
             print(f"Maximum = {total}.")
         else:
-            return val
+            return n
 
 
 # -----------------------------------------------------
@@ -164,71 +152,58 @@ def demander_nb_routeurs(total: int, actuel: int | None) -> int:
 # -----------------------------------------------------
 
 def main():
-    # ID du client
     if len(sys.argv) >= 2:
         cid = sys.argv[1].upper()
     else:
-        cid = input("Id client (A,B,C...) : ").upper()
+        cid = input("Id client : ").upper()
 
-    # Adresse du client
     c_host, c_port = load_node(cid)
 
-    # Thread écoute des messages entrants
     threading.Thread(
         target=listen_incoming,
         args=(cid, c_host, c_port),
         daemon=True
     ).start()
 
-    # Adresse du master
     master_h, master_p = load_node("MASTER")
-
-    # Cache de nombre de routeurs
     nb_hops = None
 
-    print(f"[CLIENT {cid}] Prêt. Format message : DEST: texte")
+    print(f"[CLIENT {cid}] Prêt. Format : DEST: message")
 
     while True:
         line = input("> ").strip()
         if not line or ":" not in line:
             continue
 
-        dest, message = line.split(":", 1)
+        dest, message = line.split(":",1)
         dest = dest.strip().upper()
         message = message.strip()
 
         if not message:
             continue
 
-        # Adresse du destinataire
         d_host, d_port = load_node(dest)
-
-        # Liste des routeurs
         routers = get_routers(master_h, master_p)
+
         if len(routers) < 3:
-            print("[CLIENT] Pas assez de routeurs en ligne.")
+            print("Pas assez de routeurs.")
             continue
 
-        # Choix dynamique du nombre de routeurs
         nb_hops = demander_nb_routeurs(len(routers), nb_hops)
-
-        # Chemin aléatoire
         path = random.sample(routers, nb_hops)
-        print(f"[CLIENT {cid}] Chemin : {[r[0] for r in path]}")
 
-        # Construction de l'oignon
-        # Dernière couche
-        plain = f"{d_host}|{d_port}|{cid}|{message}"
+        print(f"[CLIENT {cid}] Chemin :", [r[0] for r in path])
+
+        # couche finale
+        plain = f"{d_host}|{d_port}|{cid}|{message}".strip()
         cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
 
-        # Couches intermédiaires
+        # couches intermédiaires
         for i in range(nb_hops - 2, -1, -1):
-            next_h = path[i + 1][1]
-            next_p = path[i + 1][2]
-            layer = f"{next_h}|{next_p}|{cipher}"
+            nh, np = path[i+1][1], path[i+1][2]
+            layer = f"{nh}|{np}|{cipher}"
             cipher = encrypt_str(layer, (path[i][3], path[i][4]))
 
-        # Envoi au premier routeur
         entry = path[0]
 
         try:
@@ -236,10 +211,9 @@ def main():
             s.connect((entry[1], entry[2]))
             send_packet(s, "ONION|" + cipher)
             s.close()
-
-            print(f"[CLIENT {cid}] Message envoyé via {[r[0] for r in path]}")
+            print(f"[CLIENT {cid}] Message envoyé.")
         except Exception as e:
-            print("[CLIENT] Erreur d’envoi :", e)
+            print("[CLIENT] Erreur d'envoi :", e)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
 # -----------------------------------------------------
 # Lit noeuds.txt → (host, port)
-# Compatible avec tout le reste du projet
 # -----------------------------------------------------
 def load_node(node_id: str):
     with CONFIG.open() as f:
@@ -23,15 +22,15 @@ def load_node(node_id: str):
 
 
 # -----------------------------------------------------
-# Connexion MariaDB sans JSON, sans IP en dur
+# Connexion MariaDB
 # -----------------------------------------------------
 def get_connection():
     host, port = load_node("DB")
 
     try:
         conn = mariadb.connect(
-            user="root",          # le testeur changera si besoin
-            password="toto",      # tu peux aussi mettre "" pour Linux
+            user="root",
+            password="toto",
             host=host,
             port=port,
             database="onion_project"
@@ -44,7 +43,7 @@ def get_connection():
 
 
 # -----------------------------------------------------
-# Création tables minimales
+# Création tables
 # -----------------------------------------------------
 def init_database():
     conn = get_connection()
@@ -74,7 +73,31 @@ def init_database():
 
 
 # -----------------------------------------------------
-# Fonctions ROUTERS
+# RESET TABLE routers
+# -----------------------------------------------------
+def reset_routers():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM routers;")
+    conn.commit()
+    conn.close()
+    print("[DB] Table routers vidée.")
+
+
+# -----------------------------------------------------
+# RESET TABLE routing_table
+# -----------------------------------------------------
+def reset_routing_table():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM routing_table;")
+    conn.commit()
+    conn.close()
+    print("[DB] Table routing_table vidée.")
+
+
+# -----------------------------------------------------
+# ROUTERS
 # -----------------------------------------------------
 def add_router(name: str, ip: str, port: int, public_key: str):
     conn = get_connection()
@@ -92,16 +115,14 @@ def add_router(name: str, ip: str, port: int, public_key: str):
 def get_routers():
     conn = get_connection()
     cur = conn.cursor()
-
     cur.execute("SELECT name, ip, port, public_key FROM routers;")
     rows = cur.fetchall()
-
     conn.close()
     return rows
 
 
 # -----------------------------------------------------
-# Fonctions ROUTING TABLE
+# ROUTING TABLE
 # -----------------------------------------------------
 def add_route(source: str, next_hop: str):
     conn = get_connection()
@@ -119,9 +140,7 @@ def add_route(source: str, next_hop: str):
 def get_routes():
     conn = get_connection()
     cur = conn.cursor()
-
     cur.execute("SELECT source, next_hop FROM routing_table;")
     rows = cur.fetchall()
-
     conn.close()
     return rows
