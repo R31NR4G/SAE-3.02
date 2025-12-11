@@ -5,8 +5,7 @@ from pathlib import Path
 from database.onion_bdd import (
     add_router,
     get_routers,
-    reset_routers,
-    reset_routing_table
+    reset_routers
 )
 
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
@@ -63,7 +62,7 @@ def recv_packet(sock: socket.socket):
 
 
 # -----------------------------------------------------
-# TRAITEMENT CLIENTS ET ROUTEURS
+# TRAITEMENT CLIENTS & ROUTEURS
 # -----------------------------------------------------
 def handle_client(conn, addr):
     try:
@@ -72,7 +71,7 @@ def handle_client(conn, addr):
             if not pkt:
                 break
 
-            # CLIENT → demande liste des routeurs
+            # CLIENT DEMANDE LA LISTE DES ROUTEURS
             if pkt == "ROUTER_INFO_REQUEST":
                 routers = get_routers()
 
@@ -81,10 +80,9 @@ def handle_client(conn, addr):
                     n, e = pub.split(",")
                     parts.append(f"{rid},{host},{port},{n},{e}")
 
-                resp = "ROUTER_INFO|" + ";".join(parts)
-                send_packet(conn, resp)
+                send_packet(conn, "ROUTER_INFO|" + ";".join(parts))
 
-            # ROUTEUR → REGISTER
+            # ROUTEUR S'ENREGISTRE
             elif pkt.startswith("REGISTER|"):
                 _, rid, h, p, n, e = pkt.split("|")
                 pub = f"{n},{e}"
@@ -104,18 +102,18 @@ def handle_client(conn, addr):
 # MASTER PRINCIPAL
 # -----------------------------------------------------
 def main():
-    host, port = load_node("MASTER")
+    _, port = load_node("MASTER")  # On ignore l'IP du fichier
 
-    # ⚠️ RESET des deux tables important
     reset_routers()
-    reset_routing_table()
 
     serv = socket.socket()
     serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    serv.bind((host, port))
+
+    # LE MASTER ÉCOUTE PARTOUT
+    serv.bind(("0.0.0.0", port))
     serv.listen()
 
-    print(f"[MASTER] En écoute sur {host}:{port}")
+    print(f"[MASTER] En écoute sur 0.0.0.0:{port}")
     print("[MASTER] En attente de clients/routeurs...")
 
     while True:

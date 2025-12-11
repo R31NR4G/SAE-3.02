@@ -43,12 +43,13 @@ def get_connection():
 
 
 # -----------------------------------------------------
-# Création tables
+# Création tables utiles
 # -----------------------------------------------------
 def init_database():
     conn = get_connection()
     cur = conn.cursor()
 
+    # Table des routeurs UNIQUEMENT
     cur.execute("""
         CREATE TABLE IF NOT EXISTS routers (
             id INT PRIMARY KEY AUTO_INCREMENT,
@@ -59,21 +60,13 @@ def init_database():
         );
     """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS routing_table (
-            id INT PRIMARY KEY AUTO_INCREMENT,
-            source VARCHAR(50) NOT NULL,
-            next_hop VARCHAR(50) NOT NULL
-        );
-    """)
-
     conn.commit()
     conn.close()
     print("[DB] Base initialisée.")
 
 
 # -----------------------------------------------------
-# RESET TABLE routers
+# RESET ROUTERS (au lancement)
 # -----------------------------------------------------
 def reset_routers():
     conn = get_connection()
@@ -85,19 +78,7 @@ def reset_routers():
 
 
 # -----------------------------------------------------
-# RESET TABLE routing_table
-# -----------------------------------------------------
-def reset_routing_table():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM routing_table;")
-    conn.commit()
-    conn.close()
-    print("[DB] Table routing_table vidée.")
-
-
-# -----------------------------------------------------
-# ROUTERS
+# ROUTERS : add + get
 # -----------------------------------------------------
 def add_router(name: str, ip: str, port: int, public_key: str):
     conn = get_connection()
@@ -116,31 +97,6 @@ def get_routers():
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT name, ip, port, public_key FROM routers;")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-# -----------------------------------------------------
-# ROUTING TABLE
-# -----------------------------------------------------
-def add_route(source: str, next_hop: str):
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO routing_table (source, next_hop)
-        VALUES (?, ?);
-    """, (source, next_hop))
-
-    conn.commit()
-    conn.close()
-
-
-def get_routes():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT source, next_hop FROM routing_table;")
     rows = cur.fetchall()
     conn.close()
     return rows

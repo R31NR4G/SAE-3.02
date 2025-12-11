@@ -7,10 +7,10 @@ from crypto.onion_rsa import generate_keypair, decrypt_str
 
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
+
 # -----------------------------------------------------
 # OUTILS
 # -----------------------------------------------------
-
 def load_node(node_id):
     """Lit noeuds.txt et renvoie (host, port)."""
     with CONFIG.open() as f:
@@ -57,10 +57,10 @@ def recv_packet(sock):
 
     return data.decode(errors="ignore")
 
+
 # -----------------------------------------------------
 # COEUR DU ROUTEUR (ROUTAGE ONION)
 # -----------------------------------------------------
-
 def handle_onion(conn, addr, private_key, rid):
     try:
         pkt = recv_packet(conn)
@@ -72,104 +72,103 @@ def handle_onion(conn, addr, private_key, rid):
 
         cipher = pkt.split("|", 1)[1]
 
-        # Déchiffrement couche
+        # Déchiffrement
         plain = decrypt_str(cipher, private_key)
-
         if not plain:
             print(f"[{rid}] Couche vide / invalide.")
             return
 
-        # Nettoyage pour éviter champs vides
         parts = [p for p in plain.split("|") if p]
 
-        # -----------------------------------------
-        # COUCHE INTERMÉDIAIRE
-        # next_host | next_port | next_cipher
-        # -----------------------------------------
+        # Couche intermédiaire
         if len(parts) == 3:
             nh, np, next_cipher = parts
+            forward(rid, nh, int(np), next_cipher)
 
-            try:
-                np = int(np)
-            except:
-                print(f"[{rid}] Port intermédiaire invalide.")
-                return
-
-            forward(rid, nh, np, next_cipher)
-
-        # -----------------------------------------
-        # COUCHE FINALE
-        # dest_host | dest_port | from_id | message
-        # -----------------------------------------
+        # Couche finale
         elif len(parts) == 4:
             dh, dp, fid, msg = parts
-
-            try:
-                dp = int(dp)
-            except:
-                print(f"[{rid}] Port destinataire invalide.")
-                return
-
-            deliver(rid, dh, dp, fid, msg)
+            deliver(rid, dh, int(dp), fid, msg)
 
         else:
-            print(f"[{rid}] Couche onion invalide :", plain)
+            print(f"[{rid}] Couche onion invalide.")
 
     finally:
         conn.close()
 
 
 def forward(rid, host, port, cipher):
-    """Envoie au routeur suivant."""
+    """Forward vers routeur suivant - logs anonymisés."""
     try:
         s = socket.socket()
         s.connect((host, port))
         send_packet(s, "ONION|" + cipher)
         s.close()
-        print(f"[{rid}] Forward -> {host}:{port}")
+
+        print(f"[{rid}] Transmission d'une couche onion.")
+
     except:
-        print(f"[{rid}] Échec du forward vers {host}:{port}")
+        print(f"[{rid}] Échec transmission.")
 
 
 def deliver(rid, host, port, from_id, msg):
-    """Envoie au destinataire final (client)."""
+    """Envoie au client final - logs anonymisés."""
     try:
         s = socket.socket()
         s.connect((host, port))
         send_packet(s, f"DELIVER|{from_id}|{msg}")
         s.close()
-        print(f"[{rid}] Message livré -> {host}:{port}")
+
+        print(f"[{rid}] Couche finale délivrée.")
+
     except:
-        print(f"[{rid}] Échec livraison -> {host}:{port}")
+        print(f"[{rid}] Échec livraison finale.")
+
 
 # -----------------------------------------------------
-# MAIN
+# MAIN ROUTEUR - SUPPORT DES ARGUMENTS CLI
 # -----------------------------------------------------
-
 def main():
-    # ID du routeur
+    # -------------------------------------------------
+    # ARG 1 → ID du routeur (R1, R2…)
+    # ARG 2 → host OU host:port
+    # ARG 3 → port (optionnel si host:port utilisé)
+    # -------------------------------------------------
     if len(sys.argv) >= 2:
         rid = sys.argv[1].upper()
     else:
         rid = input("Id routeur (R1, R2...) : ").upper()
 
+    # Valeurs par défaut venant de noeuds.txt
     r_host, r_port = load_node(rid)
-    m_host, m_port = load_node("MASTER")
 
-    # Génération clé RSA
+    # Si l'utilisateur force une IP : python router.py R1 1.2.3.4 6001
+    if len(sys.argv) == 4:
+        r_host = sys.argv[2]
+        r_port = int(sys.argv[3])
+
+    # Si format host:port → python router.py R1 1.2.3.4:6001
+    elif len(sys.argv) == 3 and ":" in sys.argv[2]:
+        host_port = sys.argv[2].split(":")
+        r_host = host_port[0]
+        r_port = int(host_port[1])
+
+    master_host, master_port = load_node("MASTER")
+
+    # Génération de clés RSA
     pub, priv = generate_keypair()
     n, e = pub
 
-    # Enregistrement auprès du master
+    # REGISTER auprès du master
     try:
         s = socket.socket()
-        s.connect((m_host, m_port))
+        s.connect((master_host, master_port))
         send_packet(s, f"REGISTER|{rid}|{r_host}|{r_port}|{n}|{e}")
         s.close()
     except:
         print(f"[{rid}] Impossible de s'enregistrer auprès du master.")
 
-    # Socket d'écoute
+    # Socket d’écoute
     serv = socket.socket()
     serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serv.bind((r_host, r_port))
