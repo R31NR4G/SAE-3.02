@@ -15,17 +15,17 @@ CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 def load_node(node_id):
     with CONFIG.open() as f:
         for line in f:
-            line=line.strip()
+            line = line.strip()
             if not line or line.startswith("#"):
                 continue
             nid, host, port = line.split(";")
-            if nid.upper()==node_id.upper():
+            if nid.upper() == node_id.upper():
                 return host, int(port)
     raise RuntimeError(f"Noeud {node_id} introuvable.")
 
 
 def send_packet(sock, payload):
-    """Envoie taille ASCII + \n + payload."""
+    """Envoie taille ASCII + \\n + payload."""
     data = payload.encode()
     header = str(len(data)).encode() + b"\n"
     sock.sendall(header + data)
@@ -64,19 +64,19 @@ def recv_packet(sock):
 
 def listen_incoming(my_id, host, port):
     s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((host, port))
     s.listen()
 
     print(f"[CLIENT {my_id}] En écoute sur {host}:{port}")
 
     while True:
-        conn,addr = s.accept()
+        conn, addr = s.accept()
         pkt = recv_packet(conn)
         conn.close()
 
         if pkt and pkt.startswith("DELIVER|"):
-            _, fid, msg = pkt.split("|",2)
+            _, fid, msg = pkt.split("|", 2)
             print(f"\n[CLIENT {my_id}] Message de {fid} : {msg}")
             print("> ", end="", flush=True)
 
@@ -96,7 +96,7 @@ def get_routers(master_h, master_p):
         if not resp or not resp.startswith("ROUTER_INFO|"):
             return []
 
-        data = resp.split("|",1)[1]
+        data = resp.split("|", 1)[1]
         routers = []
 
         for item in data.split(";"):
@@ -175,7 +175,7 @@ def main():
         if not line or ":" not in line:
             continue
 
-        dest, message = line.split(":",1)
+        dest, message = line.split(":", 1)
         dest = dest.strip().upper()
         message = message.strip()
 
@@ -192,15 +192,17 @@ def main():
         nb_hops = demander_nb_routeurs(len(routers), nb_hops)
         path = random.sample(routers, nb_hops)
 
-        print(f"[CLIENT {cid}] Chemin :", [r[0] for r in path])
+        # -------------------------------------------------
+        # CONSTRUCTION DE L'OIGNON (ANONYMISÉE)
+        # -------------------------------------------------
 
         # couche finale
-        plain = f"{d_host}|{d_port}|{cid}|{message}".strip()
+        plain = f"{d_host}|{d_port}|{cid}|{message}"
         cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
 
         # couches intermédiaires
         for i in range(nb_hops - 2, -1, -1):
-            nh, np = path[i+1][1], path[i+1][2]
+            nh, np = path[i + 1][1], path[i + 1][2]
             layer = f"{nh}|{np}|{cipher}"
             cipher = encrypt_str(layer, (path[i][3], path[i][4]))
 

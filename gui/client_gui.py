@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from crypto.onion_rsa import encrypt_str
-from onion_client import send_packet, recv_packet, load_node, get_routers
+from client.onion_tools import send_packet, recv_packet, load_node, get_routers
 
 
 # ============================================================
