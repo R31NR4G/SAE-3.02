@@ -8,10 +8,10 @@ from crypto.onion_rsa import encrypt_str
 
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
+
 # -----------------------------------------------------
 # OUTILS
 # -----------------------------------------------------
-
 def load_node(node_id):
     with CONFIG.open() as f:
         for line in f:
@@ -25,14 +25,12 @@ def load_node(node_id):
 
 
 def send_packet(sock, payload):
-    """Envoie taille ASCII + \\n + payload."""
     data = payload.encode()
     header = str(len(data)).encode() + b"\n"
     sock.sendall(header + data)
 
 
 def recv_packet(sock):
-    """Reçoit paquet : taille ASCII sur une ligne puis payload."""
     size_bytes = b""
     while not size_bytes.endswith(b"\n"):
         chunk = sock.recv(1)
@@ -58,33 +56,74 @@ def recv_packet(sock):
     return data.decode(errors="ignore")
 
 
+def looks_like_id(s: str) -> bool:
+    # ID simple type A, B, C, C12, CLIENT1, etc.
+    if not s:
+        return False
+    if ":" in s:
+        return False
+    if "." in s:
+        return False
+    return True
+
+
+# -----------------------------------------------------
+# MASTER -> ENREGISTREMENT DYNAMIQUE CLIENT
+# -----------------------------------------------------
+def register_client_dynamic(master_h, master_p, advertise_host, listen_port):
+    try:
+        s = socket.socket()
+        s.connect((master_h, master_p))
+        send_packet(s, f"REGISTER_CLIENT_DYNAMIC|{advertise_host}|{listen_port}")
+        rep = recv_packet(s)
+        s.close()
+
+        if rep and rep.startswith("ASSIGNED_CLIENT|"):
+            return rep.split("|", 1)[1].strip().upper()
+        return None
+    except:
+        return None
+
+
+def resolve_client_via_master(master_h, master_p, dest_id):
+    """Demande au master l'IP/port d'un client dynamique (ou statique)."""
+    try:
+        s = socket.socket()
+        s.connect((master_h, master_p))
+        send_packet(s, f"CLIENT_INFO_REQUEST|{dest_id}")
+        rep = recv_packet(s)
+        s.close()
+
+        # OK|host|port  ou  NOT_FOUND
+        if rep and rep.startswith("CLIENT_INFO|OK|"):
+            _, _, h, p = rep.split("|")
+            return h, int(p)
+
+        return None
+    except:
+        return None
+
+
 # -----------------------------------------------------
 # RÉCEPTION DES MESSAGES
 # -----------------------------------------------------
-
-def listen_incoming(my_id, host, port):
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, port))
-    s.listen()
-
-    print(f"[CLIENT {my_id}] En écoute sur {host}:{port}")
-
+def listen_incoming(my_id_ref, server_socket):
+    # my_id_ref : liste à 1 élément, pour afficher l'ID même s'il arrive après REGISTER
     while True:
-        conn, addr = s.accept()
+        conn, addr = server_socket.accept()
         pkt = recv_packet(conn)
         conn.close()
 
         if pkt and pkt.startswith("DELIVER|"):
             _, fid, msg = pkt.split("|", 2)
-            print(f"\n[CLIENT {my_id}] Message de {fid} : {msg}")
+            cid = my_id_ref[0] if my_id_ref[0] else "?"
+            print(f"\n[CLIENT {cid}] Message de {fid} : {msg}")
             print("> ", end="", flush=True)
 
 
 # -----------------------------------------------------
 # MASTER → liste des routeurs
 # -----------------------------------------------------
-
 def get_routers(master_h, master_p):
     try:
         s = socket.socket()
@@ -114,7 +153,6 @@ def get_routers(master_h, master_p):
 # -----------------------------------------------------
 # SELECTION NOMBRE DE ROUTEURS
 # -----------------------------------------------------
-
 def demander_nb_routeurs(total, actuel):
     if total < 3:
         raise RuntimeError("Il faut au moins 3 routeurs.")
@@ -150,25 +188,74 @@ def demander_nb_routeurs(total, actuel):
 # -----------------------------------------------------
 # CLIENT PRINCIPAL
 # -----------------------------------------------------
-
 def main():
-    if len(sys.argv) >= 2:
-        cid = sys.argv[1].upper()
-    else:
-        cid = input("Id client : ").upper()
+    master_h, master_p = load_node("MASTER")
 
-    c_host, c_port = load_node(cid)
+    # -------------------------
+    # MODE STATIQUE (ancien) :
+    #   py -m client.onion_client A
+    # MODE DYNAMIQUE (infini) :
+    #   py -m client.onion_client
+    #   py -m client.onion_client 0.0.0.0 0 192.168.1.50   (VM)
+    # -------------------------
+
+    cid = None
+    listen_host = "0.0.0.0"
+    listen_port = 0
+    advertise_host = "127.0.0.1"
+
+    # Parsing simple :
+    # - si arg1 ressemble à un ID -> statique
+    # - sinon -> dynamique avec host/port/advertise optionnels
+    if len(sys.argv) >= 2 and looks_like_id(sys.argv[1]):
+        cid = sys.argv[1].upper()
+        c_host, c_port = load_node(cid)
+        listen_host, listen_port = c_host, c_port
+        # En statique, on annonce l'host du fichier
+        advertise_host = c_host if c_host != "0.0.0.0" else "127.0.0.1"
+    else:
+        # dynamique
+        if len(sys.argv) >= 2:
+            listen_host = sys.argv[1]
+        if len(sys.argv) >= 3:
+            listen_port = int(sys.argv[2])
+        else:
+            listen_port = 0
+        if len(sys.argv) >= 4:
+            advertise_host = sys.argv[3]
+
+    # Crée la socket d'écoute tout de suite (pour connaître le port réel si 0)
+    serv = socket.socket()
+    serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    serv.bind((listen_host, listen_port))
+    serv.listen()
+
+    real_host, real_port = serv.getsockname()
+
+    my_id_ref = [cid]  # pour l'affichage dans le thread
 
     threading.Thread(
         target=listen_incoming,
-        args=(cid, c_host, c_port),
+        args=(my_id_ref, serv),
         daemon=True
     ).start()
 
-    master_h, master_p = load_node("MASTER")
-    nb_hops = None
+    # Si dynamique -> REGISTER au master pour recevoir un ID
+    if cid is None:
+        assigned = register_client_dynamic(master_h, master_p, advertise_host, real_port)
+        if not assigned:
+            print("[CLIENT ?] Impossible de s'enregistrer auprès du master.")
+            cid = "C?"
+        else:
+            cid = assigned
 
-    print(f"[CLIENT {cid}] Prêt. Format : DEST: message")
+        my_id_ref[0] = cid
+        print(f"[CLIENT {cid}] En écoute sur {listen_host}:{real_port} (annonce {advertise_host}:{real_port})")
+    else:
+        print(f"[CLIENT {cid}] En écoute sur {listen_host}:{real_port}")
+
+    nb_hops = None
+    print(f"[CLIENT {cid}] Prêt. Format : DEST: message (DEST = ID client)")
 
     while True:
         line = input("> ").strip()
@@ -178,23 +265,28 @@ def main():
         dest, message = line.split(":", 1)
         dest = dest.strip().upper()
         message = message.strip()
-
         if not message:
             continue
 
-        d_host, d_port = load_node(dest)
-        routers = get_routers(master_h, master_p)
+        # Résolution destination :
+        # 1) si dans noeuds.txt -> OK (ancien mode A/B/C)
+        # 2) sinon -> demande au master (clients dynamiques C1/C2/...)
+        try:
+            d_host, d_port = load_node(dest)
+        except:
+            resolved = resolve_client_via_master(master_h, master_p, dest)
+            if not resolved:
+                print(f"[CLIENT {cid}] Destination inconnue : {dest}")
+                continue
+            d_host, d_port = resolved
 
+        routers = get_routers(master_h, master_p)
         if len(routers) < 3:
             print("Pas assez de routeurs.")
             continue
 
         nb_hops = demander_nb_routeurs(len(routers), nb_hops)
         path = random.sample(routers, nb_hops)
-
-        # -------------------------------------------------
-        # CONSTRUCTION DE L'OIGNON (ANONYMISÉE)
-        # -------------------------------------------------
 
         # couche finale
         plain = f"{d_host}|{d_port}|{cid}|{message}"

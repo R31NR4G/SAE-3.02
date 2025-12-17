@@ -62,6 +62,24 @@ def recv_packet(sock: socket.socket):
 
 
 # -----------------------------------------------------
+# ID ROUTEUR DYNAMIQUE
+# -----------------------------------------------------
+def allocate_router_id() -> str:
+    """Attribue un nouvel ID routeur R<n> non utilisé."""
+    routers = get_routers()
+    used = set()
+    for rid, host, port, pub in routers:
+        used.add(rid.upper())
+
+    i = 1
+    while True:
+        rid = f"R{i}"
+        if rid not in used:
+            return rid
+        i += 1
+
+
+# -----------------------------------------------------
 # TRAITEMENT CLIENTS & ROUTEURS
 # -----------------------------------------------------
 def handle_client(conn, addr):
@@ -74,21 +92,28 @@ def handle_client(conn, addr):
             # CLIENT DEMANDE LA LISTE DES ROUTEURS
             if pkt == "ROUTER_INFO_REQUEST":
                 routers = get_routers()
-
                 parts = []
                 for rid, host, port, pub in routers:
                     n, e = pub.split(",")
                     parts.append(f"{rid},{host},{port},{n},{e}")
-
                 send_packet(conn, "ROUTER_INFO|" + ";".join(parts))
 
-            # ROUTEUR S'ENREGISTRE
+            # ROUTEUR S'ENREGISTRE (mode statique / rétrocompat)
             elif pkt.startswith("REGISTER|"):
                 _, rid, h, p, n, e = pkt.split("|")
                 pub = f"{n},{e}"
-
                 add_router(rid, h, int(p), pub)
                 print(f"[MASTER] Routeur {rid} enregistré en BDD.")
+
+            # ROUTEUR S'ENREGISTRE (mode dynamique = illimité)
+            elif pkt.startswith("REGISTER_DYNAMIC|"):
+                # Format: REGISTER_DYNAMIC|host|port|n|e
+                _, h, p, n, e = pkt.split("|")
+                rid = allocate_router_id()
+                pub = f"{n},{e}"
+                add_router(rid, h, int(p), pub)
+                send_packet(conn, f"ASSIGNED|{rid}")
+                print(f"[MASTER] Routeur {rid} (dynamique) enregistré : {h}:{p}")
 
             else:
                 print("[MASTER] Message inconnu :", pkt)
@@ -99,7 +124,7 @@ def handle_client(conn, addr):
 
 
 # -----------------------------------------------------
-# MASTER PRINCIPAL
+# MASTER
 # -----------------------------------------------------
 def main():
     _, port = load_node("MASTER")  # On ignore l'IP du fichier
