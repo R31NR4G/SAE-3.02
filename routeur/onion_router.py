@@ -9,11 +9,7 @@ from crypto.onion_rsa import generate_keypair, decrypt_str
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
 
-# -----------------------------------------------------
-# OUTILS
-# -----------------------------------------------------
 def load_node(node_id):
-    """Lit noeuds.txt et renvoie (host, port)."""
     with CONFIG.open() as f:
         for line in f:
             line = line.strip()
@@ -57,19 +53,17 @@ def recv_packet(sock):
     return data.decode(errors="ignore")
 
 
-# -----------------------------------------------------
-# COEUR DU ROUTEUR (ROUTAGE ONION)
-# -----------------------------------------------------
 def handle_onion(conn, addr, private_key, rid):
     try:
         pkt = recv_packet(conn)
-        if not pkt or not pkt.startswith("ONION|"):
+        if not pkt:
+            return
+        if not pkt.startswith("ONION|"):
             return
 
         cipher = pkt.split("|", 1)[1]
         plain = decrypt_str(cipher, private_key)
         if not plain:
-            print(f"[{rid}] Couche invalide.")
             return
 
         parts = [p for p in plain.split("|") if p]
@@ -80,8 +74,7 @@ def handle_onion(conn, addr, private_key, rid):
         elif len(parts) == 4:
             dh, dp, fid, msg = parts
             deliver(rid, dh, int(dp), fid, msg)
-        else:
-            print(f"[{rid}] Couche onion invalide.")
+
     finally:
         conn.close()
 
@@ -92,7 +85,7 @@ def forward(rid, host, port, cipher):
         s.connect((host, port))
         send_packet(s, "ONION|" + cipher)
         s.close()
-        print(f"[{rid}] Transmission d'une couche.")
+        print(f"[{rid}] Transmission d'une couche onion.")
     except:
         print(f"[{rid}] Échec transmission.")
 
@@ -108,14 +101,9 @@ def deliver(rid, host, port, from_id, msg):
         print(f"[{rid}] Échec livraison finale.")
 
 
-# -----------------------------------------------------
-# MAIN ROUTEUR - MODE DYNAMIQUE
-# -----------------------------------------------------
 def main():
-    # MASTER par défaut depuis noeuds.txt
+    # MASTER par défaut depuis noeuds.txt + surcharge env
     master_host, master_port = load_node("MASTER")
-
-    # Surcharge via variables d’environnement (portable SAE)
     env_h = os.getenv("MASTER_HOST")
     env_p = os.getenv("MASTER_PORT")
     if env_h:
@@ -135,12 +123,17 @@ def main():
         if len(sys.argv) == 4:
             listen_host = sys.argv[2]
             listen_port = int(sys.argv[3])
-
+        elif len(sys.argv) == 3 and ":" in sys.argv[2]:
+            hp = sys.argv[2].split(":")
+            listen_host = hp[0]
+            listen_port = int(hp[1])
     else:
         if len(sys.argv) >= 2:
             listen_host = sys.argv[1]
         if len(sys.argv) >= 3:
             listen_port = int(sys.argv[2])
+        else:
+            listen_port = 0
 
     pub, priv = generate_keypair()
     n, e = pub
@@ -150,12 +143,21 @@ def main():
     serv.bind((listen_host, listen_port))
     serv.listen()
 
-    real_host, real_port = serv.getsockname()
+    _, real_port = serv.getsockname()
 
+    # --- annonce IP correcte (pas 127.0.0.1 sur VM) ---
     advertise_host = listen_host
     if advertise_host == "0.0.0.0":
-        advertise_host = "127.0.0.1"
+        # on déduit l'IP locale utilisée pour joindre le master
+        try:
+            tmp = socket.socket()
+            tmp.connect((master_host, master_port))
+            advertise_host = tmp.getsockname()[0]
+            tmp.close()
+        except:
+            advertise_host = "127.0.0.1"
 
+    # REGISTER auprès du master
     try:
         s = socket.socket()
         s.connect((master_host, master_port))
@@ -167,24 +169,21 @@ def main():
                 rid = rep.split("|", 1)[1].strip().upper()
             else:
                 rid = "R?"
+                print("[ROUTEUR] Enregistrement dynamique échoué (pas de réponse master).")
         else:
             send_packet(s, f"REGISTER|{rid}|{advertise_host}|{real_port}|{n}|{e}")
 
         s.close()
-    except:
+    except Exception as e:
         if rid is None:
             rid = "R?"
-        print(f"[{rid}] Impossible de s'enregistrer auprès du master.")
+        print(f"[{rid}] Impossible de s'enregistrer auprès du master :", e)
 
     print(f"[ROUTEUR {rid}] En écoute sur {listen_host}:{real_port} (annonce {advertise_host}:{real_port})")
 
     while True:
         conn, addr = serv.accept()
-        threading.Thread(
-            target=handle_onion,
-            args=(conn, addr, priv, rid),
-            daemon=True
-        ).start()
+        threading.Thread(target=handle_onion, args=(conn, addr, priv, rid), daemon=True).start()
 
 
 if __name__ == "__main__":
