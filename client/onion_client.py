@@ -39,32 +39,35 @@ def recv_packet(sock):
             return None
         size_bytes += chunk
 
-    try:
-        size = int(size_bytes.strip())
-    except:
-        return None
-
-    if size <= 0 or size > 20000:
-        return None
-
+    size = int(size_bytes.strip())
     data = b""
     while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            return None
-        data += chunk
-
+        data += sock.recv(size - len(data))
     return data.decode(errors="ignore")
 
 
 def looks_like_id(s: str) -> bool:
-    if not s or ":" in s or "." in s:
-        return False
-    return True
+    return s and ":" not in s and "." not in s
 
 
 # -----------------------------------------------------
-# MASTER -> CLIENT
+# ÉCOUTE DES MESSAGES
+# -----------------------------------------------------
+def listen_incoming(my_id_ref, server_socket):
+    while True:
+        conn, _ = server_socket.accept()
+        pkt = recv_packet(conn)
+        conn.close()
+
+        if pkt and pkt.startswith("DELIVER|"):
+            _, fid, msg = pkt.split("|", 2)
+            cid = my_id_ref[0] if my_id_ref[0] else "?"
+            print(f"\n[CLIENT {cid}] Message de {fid} : {msg}")
+            print("> ", end="", flush=True)
+
+
+# -----------------------------------------------------
+# MASTER COMMUNICATION
 # -----------------------------------------------------
 def register_client_dynamic(master_h, master_p, advertise_host, listen_port):
     try:
@@ -74,13 +77,13 @@ def register_client_dynamic(master_h, master_p, advertise_host, listen_port):
         rep = recv_packet(s)
         s.close()
         if rep and rep.startswith("ASSIGNED_CLIENT|"):
-            return rep.split("|", 1)[1].strip().upper()
-        return None
+            return rep.split("|", 1)[1]
     except:
-        return None
+        pass
+    return None
 
 
-def resolve_client_via_master(master_h, master_p, dest_id):
+def resolve_client(master_h, master_p, dest_id):
     try:
         s = socket.socket()
         s.connect((master_h, master_p))
@@ -90,9 +93,9 @@ def resolve_client_via_master(master_h, master_p, dest_id):
         if rep and rep.startswith("CLIENT_INFO|OK|"):
             _, _, h, p = rep.split("|")
             return h, int(p)
-        return None
     except:
-        return None
+        pass
+    return None
 
 
 def get_routers(master_h, master_p):
@@ -103,16 +106,12 @@ def get_routers(master_h, master_p):
         resp = recv_packet(s)
         s.close()
 
-        if not resp or not resp.startswith("ROUTER_INFO|"):
-            return []
-
-        data = resp.split("|", 1)[1]
         routers = []
-        for item in data.split(";"):
-            if not item:
-                continue
-            rid, h, p, n, e = item.split(",")
-            routers.append((rid, h, int(p), int(n), int(e)))
+        if resp and resp.startswith("ROUTER_INFO|"):
+            for item in resp.split("|", 1)[1].split(";"):
+                if item:
+                    rid, h, p, n, e = item.split(",")
+                    routers.append((rid, h, int(p), int(n), int(e)))
         return routers
     except:
         return []
@@ -122,69 +121,54 @@ def get_routers(master_h, master_p):
 # CLIENT PRINCIPAL
 # -----------------------------------------------------
 def main():
-    # MASTER par défaut depuis noeuds.txt
     master_h, master_p = load_node("MASTER")
-
-    # Surcharge via variables d’environnement (portable SAE)
-    env_h = os.getenv("MASTER_HOST")
-    env_p = os.getenv("MASTER_PORT")
-    if env_h:
-        master_h = env_h
-    if env_p:
-        master_p = int(env_p)
+    if os.getenv("MASTER_HOST"):
+        master_h = os.getenv("MASTER_HOST")
+    if os.getenv("MASTER_PORT"):
+        master_p = int(os.getenv("MASTER_PORT"))
 
     cid = None
     listen_host = "0.0.0.0"
     listen_port = 0
-    advertise_host = "127.0.0.1"
+    advertise_host = socket.gethostbyname(socket.gethostname())
 
     if len(sys.argv) >= 2 and looks_like_id(sys.argv[1]):
         cid = sys.argv[1].upper()
-        c_host, c_port = load_node(cid)
-        listen_host, listen_port = c_host, c_port
-        advertise_host = c_host if c_host != "0.0.0.0" else "127.0.0.1"
-    else:
-        if len(sys.argv) >= 2:
-            listen_host = sys.argv[1]
-        if len(sys.argv) >= 3:
-            listen_port = int(sys.argv[2])
-        if len(sys.argv) >= 4:
-            advertise_host = sys.argv[3]
+        listen_host, listen_port = load_node(cid)
 
     serv = socket.socket()
-    serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serv.bind((listen_host, listen_port))
     serv.listen()
 
-    real_host, real_port = serv.getsockname()
+    _, real_port = serv.getsockname()
     my_id_ref = [cid]
 
     threading.Thread(
-        target=lambda: None,
+        target=listen_incoming,
+        args=(my_id_ref, serv),
         daemon=True
     ).start()
 
     if cid is None:
-        assigned = register_client_dynamic(master_h, master_p, advertise_host, real_port)
-        cid = assigned if assigned else "C?"
+        cid = register_client_dynamic(master_h, master_p, advertise_host, real_port) or "C?"
         my_id_ref[0] = cid
-        print(f"[CLIENT {cid}] En écoute sur {listen_host}:{real_port}")
-    else:
-        print(f"[CLIENT {cid}] En écoute sur {listen_host}:{real_port}")
+
+    print(f"[CLIENT {cid}] En écoute sur {listen_host}:{real_port}")
+    print("Format : DEST: message")
 
     while True:
         line = input("> ").strip()
-        if not line or ":" not in line:
+        if ":" not in line:
             continue
 
-        dest, message = line.split(":", 1)
+        dest, msg = line.split(":", 1)
         dest = dest.strip().upper()
-        message = message.strip()
+        msg = msg.strip()
 
         try:
             d_host, d_port = load_node(dest)
         except:
-            resolved = resolve_client_via_master(master_h, master_p, dest)
+            resolved = resolve_client(master_h, master_p, dest)
             if not resolved:
                 print("Destination inconnue.")
                 continue
@@ -197,23 +181,19 @@ def main():
 
         path = random.sample(routers, 3)
 
-        plain = f"{d_host}|{d_port}|{cid}|{message}"
+        plain = f"{d_host}|{d_port}|{cid}|{msg}"
         cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
 
         for i in range(1, -1, -1):
             nh, np = path[i + 1][1], path[i + 1][2]
-            layer = f"{nh}|{np}|{cipher}"
-            cipher = encrypt_str(layer, (path[i][3], path[i][4]))
+            cipher = encrypt_str(f"{nh}|{np}|{cipher}", (path[i][3], path[i][4]))
 
         entry = path[0]
-        try:
-            s = socket.socket()
-            s.connect((entry[1], entry[2]))
-            send_packet(s, "ONION|" + cipher)
-            s.close()
-            print("[CLIENT] Message envoyé.")
-        except Exception as e:
-            print("Erreur d'envoi :", e)
+        s = socket.socket()
+        s.connect((entry[1], entry[2]))
+        send_packet(s, "ONION|" + cipher)
+        s.close()
+        print("[CLIENT] Message envoyé.")
 
 
 if __name__ == "__main__":
