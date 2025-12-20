@@ -9,7 +9,6 @@ from crypto.onion_rsa import encrypt_str
 
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
-
 # -----------------------------------------------------
 # OUTILS
 # -----------------------------------------------------
@@ -50,6 +49,17 @@ def looks_like_id(s: str) -> bool:
     return s and ":" not in s and "." not in s
 
 
+def detect_local_ip(master_h, master_p):
+    try:
+        tmp = socket.socket()
+        tmp.connect((master_h, master_p))
+        ip = tmp.getsockname()[0]
+        tmp.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
+
 # -----------------------------------------------------
 # ÉCOUTE DES MESSAGES
 # -----------------------------------------------------
@@ -61,7 +71,7 @@ def listen_incoming(my_id_ref, server_socket):
 
         if pkt and pkt.startswith("DELIVER|"):
             _, fid, msg = pkt.split("|", 2)
-            cid = my_id_ref[0] if my_id_ref[0] else "?"
+            cid = my_id_ref[0] or "?"
             print(f"\n[CLIENT {cid}] Message de {fid} : {msg}")
             print("> ", end="", flush=True)
 
@@ -121,7 +131,16 @@ def get_routers(master_h, master_p):
 # CLIENT PRINCIPAL
 # -----------------------------------------------------
 def main():
+    # --- MASTER CONFIG PRIORITY ---
     master_h, master_p = load_node("MASTER")
+
+    # 1️⃣ Arguments CLI
+    if len(sys.argv) >= 3 and "." in sys.argv[1]:
+        master_h = sys.argv[1]
+        master_p = int(sys.argv[2])
+        sys.argv = sys.argv[:1] + sys.argv[3:]
+
+    # 2️⃣ Variables d’environnement
     if os.getenv("MASTER_HOST"):
         master_h = os.getenv("MASTER_HOST")
     if os.getenv("MASTER_PORT"):
@@ -130,7 +149,6 @@ def main():
     cid = None
     listen_host = "0.0.0.0"
     listen_port = 0
-    advertise_host = socket.gethostbyname(socket.gethostname())
 
     if len(sys.argv) >= 2 and looks_like_id(sys.argv[1]):
         cid = sys.argv[1].upper()
@@ -141,8 +159,9 @@ def main():
     serv.listen()
 
     _, real_port = serv.getsockname()
-    my_id_ref = [cid]
+    advertise_host = detect_local_ip(master_h, master_p)
 
+    my_id_ref = [cid]
     threading.Thread(
         target=listen_incoming,
         args=(my_id_ref, serv),
@@ -153,7 +172,7 @@ def main():
         cid = register_client_dynamic(master_h, master_p, advertise_host, real_port) or "C?"
         my_id_ref[0] = cid
 
-    print(f"[CLIENT {cid}] En écoute sur {listen_host}:{real_port}")
+    print(f"[CLIENT {cid}] En écoute sur {advertise_host}:{real_port}")
     print("Format : DEST: message")
 
     while True:

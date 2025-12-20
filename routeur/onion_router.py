@@ -26,84 +26,151 @@ def load_node(node_id):
 
 def send_packet(sock, payload):
     data = payload.encode()
-    sock.sendall(str(len(data)).encode() + b"\n" + data)
+    header = str(len(data)).encode() + b"\n"
+    sock.sendall(header + data)
 
 
 def recv_packet(sock):
-    size = int(sock.recv(32).split(b"\n")[0])
-    return sock.recv(size).decode(errors="ignore")
+    size_bytes = b""
+    while not size_bytes.endswith(b"\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            return None
+        size_bytes += chunk
+
+    try:
+        size = int(size_bytes.strip())
+    except:
+        return None
+
+    if size <= 0 or size > 20000:
+        return None
+
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            return None
+        data += chunk
+
+    return data.decode(errors="ignore")
 
 
 # -----------------------------------------------------
-# ROUTAGE
+# ROUTAGE ONION
 # -----------------------------------------------------
-def handle_onion(conn, priv, rid):
-    pkt = recv_packet(conn)
-    conn.close()
+def handle_onion(conn, private_key, rid):
+    try:
+        pkt = recv_packet(conn)
+        if not pkt or not pkt.startswith("ONION|"):
+            return
 
-    if not pkt.startswith("ONION|"):
-        return
+        cipher = pkt.split("|", 1)[1]
+        plain = decrypt_str(cipher, private_key)
+        if not plain:
+            return
 
-    plain = decrypt_str(pkt.split("|", 1)[1], priv)
-    parts = plain.split("|")
+        parts = [p for p in plain.split("|") if p]
 
-    if len(parts) == 3:
-        h, p, cipher = parts
-        forward(h, int(p), cipher)
-    elif len(parts) == 4:
-        h, p, fid, msg = parts
-        deliver(h, int(p), fid, msg)
+        if len(parts) == 3:
+            nh, np, next_cipher = parts
+            forward(nh, int(np), next_cipher)
+
+        elif len(parts) == 4:
+            dh, dp, fid, msg = parts
+            deliver(dh, int(dp), fid, msg)
+
+    finally:
+        conn.close()
 
 
 def forward(host, port, cipher):
-    s = socket.socket()
-    s.connect((host, port))
-    send_packet(s, "ONION|" + cipher)
-    s.close()
+    try:
+        s = socket.socket()
+        s.connect((host, port))
+        send_packet(s, "ONION|" + cipher)
+        s.close()
+    except:
+        pass
 
 
-def deliver(host, port, fid, msg):
-    s = socket.socket()
-    s.connect((host, port))
-    send_packet(s, f"DELIVER|{fid}|{msg}")
-    s.close()
+def deliver(host, port, from_id, msg):
+    try:
+        s = socket.socket()
+        s.connect((host, port))
+        send_packet(s, f"DELIVER|{from_id}|{msg}")
+        s.close()
+    except:
+        pass
 
 
 # -----------------------------------------------------
 # ROUTEUR PRINCIPAL
 # -----------------------------------------------------
 def main():
-    master_h, master_p = load_node("MASTER")
+    # -----------------------------
+    # CONFIG MASTER (PRIORITÉ)
+    # -----------------------------
+    master_host, master_port = load_node("MASTER")
+
+    # 1️⃣ Arguments CLI : python -m routeur.onion_router IP PORT
+    if len(sys.argv) >= 3 and "." in sys.argv[1]:
+        master_host = sys.argv[1]
+        master_port = int(sys.argv[2])
+
+    # 2️⃣ Variables d’environnement
     if os.getenv("MASTER_HOST"):
-        master_h = os.getenv("MASTER_HOST")
+        master_host = os.getenv("MASTER_HOST")
     if os.getenv("MASTER_PORT"):
-        master_p = int(os.getenv("MASTER_PORT"))
+        master_port = int(os.getenv("MASTER_PORT"))
 
-    listen_host = "0.0.0.0"
-    listen_port = 0
-
+    # -----------------------------
+    # GÉNÉRATION CLÉS
+    # -----------------------------
     pub, priv = generate_keypair()
     n, e = pub
 
+    # -----------------------------
+    # SOCKET D’ÉCOUTE
+    # -----------------------------
     serv = socket.socket()
-    serv.bind((listen_host, listen_port))
+    serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    serv.bind(("0.0.0.0", 0))  # port libre
     serv.listen()
 
     _, real_port = serv.getsockname()
 
-    tmp = socket.socket()
-    tmp.connect((master_h, master_p))
-    advertise_host = tmp.getsockname()[0]
-    tmp.close()
+    # -----------------------------
+    # IP À ANNONCER (IP RÉELLE VM)
+    # -----------------------------
+    try:
+        tmp = socket.socket()
+        tmp.connect((master_host, master_port))
+        advertise_host = tmp.getsockname()[0]
+        tmp.close()
+    except:
+        advertise_host = "127.0.0.1"
 
-    s = socket.socket()
-    s.connect((master_h, master_p))
-    send_packet(s, f"REGISTER_DYNAMIC|{advertise_host}|{real_port}|{n}|{e}")
-    rid = recv_packet(s).split("|")[1]
-    s.close()
+    # -----------------------------
+    # REGISTER DYNAMIQUE
+    # -----------------------------
+    rid = "R?"
+    try:
+        s = socket.socket()
+        s.connect((master_host, master_port))
+        send_packet(s, f"REGISTER_DYNAMIC|{advertise_host}|{real_port}|{n}|{e}")
+        rep = recv_packet(s)
+        if rep and rep.startswith("ASSIGNED|"):
+            rid = rep.split("|", 1)[1]
+        s.close()
+    except:
+        pass
 
-    print(f"[ROUTEUR {rid}] En écoute sur {listen_host}:{real_port}")
+    print(f"[ROUTEUR {rid}] En écoute sur 0.0.0.0:{real_port} (annonce {advertise_host}:{real_port})")
 
+    # -----------------------------
+    # BOUCLE PRINCIPALE
+    # -----------------------------
     while True:
         conn, _ = serv.accept()
         threading.Thread(
