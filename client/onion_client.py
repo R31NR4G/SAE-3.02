@@ -3,28 +3,14 @@ import threading
 import sys
 import random
 import os
-from pathlib import Path
 
 from crypto.onion_rsa import encrypt_str
 
-CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
 # -----------------------------------------------------
-# OUTILS
+# OUTILS TCP (taille + \n + payload)
 # -----------------------------------------------------
-def load_node(node_id):
-    with CONFIG.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            nid, host, port = line.split(";")
-            if nid.upper() == node_id.upper():
-                return host, int(port)
-    raise RuntimeError(f"Noeud {node_id} introuvable.")
-
-
-def send_packet(sock, payload):
+def send_packet(sock, payload: str):
     data = payload.encode()
     header = str(len(data)).encode() + b"\n"
     sock.sendall(header + data)
@@ -38,18 +24,22 @@ def recv_packet(sock):
             return None
         size_bytes += chunk
 
-    size = int(size_bytes.strip())
+    try:
+        size = int(size_bytes.strip())
+    except ValueError:
+        return None
+
     data = b""
     while len(data) < size:
-        data += sock.recv(size - len(data))
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            return None
+        data += chunk
     return data.decode(errors="ignore")
 
 
-def looks_like_id(s: str) -> bool:
-    return s and ":" not in s and "." not in s
-
-
 def detect_local_ip(master_h, master_p):
+    """Détecte l'IP locale utilisée pour joindre le master."""
     try:
         tmp = socket.socket()
         tmp.connect((master_h, master_p))
@@ -61,7 +51,7 @@ def detect_local_ip(master_h, master_p):
 
 
 # -----------------------------------------------------
-# ÉCOUTE DES MESSAGES
+# ÉCOUTE DES MESSAGES ENTRANTS
 # -----------------------------------------------------
 def listen_incoming(my_id_ref, server_socket):
     while True:
@@ -80,26 +70,33 @@ def listen_incoming(my_id_ref, server_socket):
 # MASTER COMMUNICATION
 # -----------------------------------------------------
 def register_client_dynamic(master_h, master_p, advertise_host, listen_port):
+    """
+    Inscription dynamique auprès du master.
+    Le master renvoie: ASSIGNED_CLIENT|C3 (exemple)
+    """
     try:
         s = socket.socket()
         s.connect((master_h, master_p))
         send_packet(s, f"REGISTER_CLIENT_DYNAMIC|{advertise_host}|{listen_port}")
         rep = recv_packet(s)
         s.close()
+
         if rep and rep.startswith("ASSIGNED_CLIENT|"):
-            return rep.split("|", 1)[1]
+            return rep.split("|", 1)[1].strip()
     except:
         pass
     return None
 
 
 def resolve_client(master_h, master_p, dest_id):
+    """Demande au master où se trouve un client DEST."""
     try:
         s = socket.socket()
         s.connect((master_h, master_p))
         send_packet(s, f"CLIENT_INFO_REQUEST|{dest_id}")
         rep = recv_packet(s)
         s.close()
+
         if rep and rep.startswith("CLIENT_INFO|OK|"):
             _, _, h, p = rep.split("|")
             return h, int(p)
@@ -109,6 +106,10 @@ def resolve_client(master_h, master_p, dest_id):
 
 
 def get_routers(master_h, master_p):
+    """
+    Demande au master la liste des routeurs.
+    Réponse attendue: ROUTER_INFO|RID,IP,PORT,n,e;RID,IP,PORT,n,e;...
+    """
     try:
         s = socket.socket()
         s.connect((master_h, master_p))
@@ -118,10 +119,12 @@ def get_routers(master_h, master_p):
 
         routers = []
         if resp and resp.startswith("ROUTER_INFO|"):
-            for item in resp.split("|", 1)[1].split(";"):
-                if item:
-                    rid, h, p, n, e = item.split(",")
-                    routers.append((rid, h, int(p), int(n), int(e)))
+            body = resp.split("|", 1)[1]
+            for item in body.split(";"):
+                if not item:
+                    continue
+                rid, h, p, n, e = item.split(",")
+                routers.append((rid.strip(), h.strip(), int(p), int(n), int(e)))
         return routers
     except:
         return []
@@ -131,49 +134,46 @@ def get_routers(master_h, master_p):
 # CLIENT PRINCIPAL
 # -----------------------------------------------------
 def main():
-    # --- MASTER CONFIG PRIORITY ---
-    master_h, master_p = load_node("MASTER")
+    # ---- MASTER HOST/PORT (priorité: args -> env -> défaut) ----
+    master_h = "127.0.0.1"
+    master_p = 5000
 
-    # 1️⃣ Arguments CLI
-    if len(sys.argv) >= 3 and "." in sys.argv[1]:
-        master_h = sys.argv[1]
-        master_p = int(sys.argv[2])
-        sys.argv = sys.argv[:1] + sys.argv[3:]
+    # Args: python -m client.onion_client <MASTER_IP> <MASTER_PORT>
+    if len(sys.argv) >= 3:
+        if "." in sys.argv[1] and sys.argv[2].isdigit():
+            master_h = sys.argv[1]
+            master_p = int(sys.argv[2])
 
-    # 2️⃣ Variables d’environnement
+    # Env: MASTER_HOST / MASTER_PORT
     if os.getenv("MASTER_HOST"):
         master_h = os.getenv("MASTER_HOST")
     if os.getenv("MASTER_PORT"):
-        master_p = int(os.getenv("MASTER_PORT"))
+        try:
+            master_p = int(os.getenv("MASTER_PORT"))
+        except:
+            pass
 
-    cid = None
-    listen_host = "0.0.0.0"
-    listen_port = 0
-
-    if len(sys.argv) >= 2 and looks_like_id(sys.argv[1]):
-        cid = sys.argv[1].upper()
-        listen_host, listen_port = load_node(cid)
-
+    # ---- Serveur local du client (réception) ----
     serv = socket.socket()
-    serv.bind((listen_host, listen_port))
+    serv.bind(("0.0.0.0", 0))  # port dynamique
     serv.listen()
 
-    _, real_port = serv.getsockname()
+    real_port = serv.getsockname()[1]
     advertise_host = detect_local_ip(master_h, master_p)
 
-    my_id_ref = [cid]
+    my_id_ref = [None]
     threading.Thread(
         target=listen_incoming,
         args=(my_id_ref, serv),
         daemon=True
     ).start()
 
-    if cid is None:
-        cid = register_client_dynamic(master_h, master_p, advertise_host, real_port) or "C?"
-        my_id_ref[0] = cid
+    cid = register_client_dynamic(master_h, master_p, advertise_host, real_port) or "C?"
+    my_id_ref[0] = cid
 
     print(f"[CLIENT {cid}] En écoute sur {advertise_host}:{real_port}")
     print("Format : DEST: message")
+    print("Le client utilise tous les routeurs disponibles (min 3), ordre aléatoire.\n")
 
     while True:
         line = input("> ").strip()
@@ -184,35 +184,47 @@ def main():
         dest = dest.strip().upper()
         msg = msg.strip()
 
-        try:
-            d_host, d_port = load_node(dest)
-        except:
-            resolved = resolve_client(master_h, master_p, dest)
-            if not resolved:
-                print("Destination inconnue.")
-                continue
-            d_host, d_port = resolved
+        # --- Résolution destination via master ---
+        resolved = resolve_client(master_h, master_p, dest)
+        if not resolved:
+            print("Destination inconnue (non enregistrée au master).")
+            continue
+        d_host, d_port = resolved
 
+        # --- Récupération routeurs ---
         routers = get_routers(master_h, master_p)
         if len(routers) < 3:
-            print("Pas assez de routeurs.")
+            print("Pas assez de routeurs (min 3).")
             continue
 
-        path = random.sample(routers, 3)
+        # --- Chemin = tous les routeurs (ordre aléatoire) ---
+        path = routers[:]            # tous
+        random.shuffle(path)         # ordre aléatoire
 
+        # --- Construction onion ---
+        # Payload final pour le dernier routeur:
         plain = f"{d_host}|{d_port}|{cid}|{msg}"
-        cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
+        last = path[-1]
+        cipher = encrypt_str(plain, (last[3], last[4]))
 
-        for i in range(1, -1, -1):
+        # Wrap des couches: de l'avant-dernier vers le premier
+        # Chaque couche contient nextHopHost|nextHopPort|<reste>
+        for i in range(len(path) - 2, -1, -1):
             nh, np = path[i + 1][1], path[i + 1][2]
             cipher = encrypt_str(f"{nh}|{np}|{cipher}", (path[i][3], path[i][4]))
 
+        # --- Envoi au routeur d'entrée UNIQUEMENT ---
         entry = path[0]
-        s = socket.socket()
-        s.connect((entry[1], entry[2]))
-        send_packet(s, "ONION|" + cipher)
-        s.close()
-        print("[CLIENT] Message envoyé.")
+        try:
+            s = socket.socket()
+            s.connect((entry[1], entry[2]))
+            send_packet(s, "ONION|" + cipher)
+            s.close()
+            print("[CLIENT] Message envoyé.")
+        except ConnectionRefusedError:
+            print(f"[ERREUR] Routeur d'entrée {entry[0]} refuse la connexion ({entry[1]}:{entry[2]}).")
+        except Exception as e:
+            print(f"[ERREUR] Envoi impossible : {e}")
 
 
 if __name__ == "__main__":
