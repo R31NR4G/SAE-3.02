@@ -11,22 +11,19 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from crypto.onion_rsa import encrypt_str
-from client.onion_tools import send_packet, recv_packet, load_node, get_routers
+from client.onion_tools import send_packet, recv_packet, get_routers
 
 
 # ============================================================
-# THREAD DE RÉCEPTION (identique à ton client actuel)
+# THREAD DE RÉCEPTION
 # ============================================================
-def listen_thread(gui, cid, host, port):
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, port))
-    s.listen()
-
-    gui.log(f"[CLIENT {cid}] En écoute sur {host}:{port}")
-
+def listen_thread(gui, server_socket):
     while True:
-        conn, addr = s.accept()
+        try:
+            conn, _ = server_socket.accept()
+        except OSError:
+            return
+
         pkt = recv_packet(conn)
         conn.close()
 
@@ -35,8 +32,19 @@ def listen_thread(gui, cid, host, port):
             gui.show_received(frm, msg)
 
 
+def detect_local_ip(master_h, master_p):
+    try:
+        tmp = socket.socket()
+        tmp.connect((master_h, master_p))
+        ip = tmp.getsockname()[0]
+        tmp.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
+
 # ============================================================
-#      INTERFACE GRAPHIQUE SIMPLE + DARK MODE
+# INTERFACE CLIENT GUI
 # ============================================================
 class ClientGUI(QMainWindow):
 
@@ -44,7 +52,6 @@ class ClientGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("Client SAE 3.02 — Mode Graphique")
 
-        # ---- DARK MODE SIMPLIFIÉ ----
         self.setStyleSheet("""
             QWidget { background-color: #2B2D31; color: #DCDDDE; font-size: 14px; }
             QLineEdit, QTextEdit, QComboBox, QSpinBox {
@@ -66,161 +73,176 @@ class ClientGUI(QMainWindow):
         grid = QGridLayout(root)
         self.setCentralWidget(root)
 
-        # ============================================================
-        #   COLONNE 1 — Infos client
-        # ============================================================
-        grid.addWidget(QLabel("Client ID :"), 0, 0)
-        self.cid = QLineEdit("A")
-        grid.addWidget(self.cid, 0, 1)
-
-        grid.addWidget(QLabel("IP Client :"), 1, 0)
-        self.ip = QLineEdit("127.0.0.1")
-        grid.addWidget(self.ip, 1, 1)
-
-        grid.addWidget(QLabel("Port Client :"), 2, 0)
-        self.port = QLineEdit("7001")
-        grid.addWidget(self.port, 2, 1)
-
-        # ============================================================
-        #   COLONNE 2 — Infos master
-        # ============================================================
-        grid.addWidget(QLabel("IP Master :"), 0, 2)
+        # -------- Infos master --------
+        grid.addWidget(QLabel("IP Master :"), 0, 0)
         self.master_ip = QLineEdit("127.0.0.1")
-        grid.addWidget(self.master_ip, 0, 3)
+        grid.addWidget(self.master_ip, 0, 1)
 
-        grid.addWidget(QLabel("Port Master :"), 1, 2)
+        grid.addWidget(QLabel("Port Master :"), 1, 0)
         self.master_port = QLineEdit("5000")
-        grid.addWidget(self.master_port, 1, 3)
+        grid.addWidget(self.master_port, 1, 1)
 
-        # ============================================================
-        #   ROUTAGE & DESTINATION
-        # ============================================================
-        grid.addWidget(QLabel("Nb routeurs :"), 2, 2)
+        # -------- Client --------
+        grid.addWidget(QLabel("Client ID :"), 2, 0)
+        self.cid = QLineEdit()
+        self.cid.setReadOnly(True)
+        grid.addWidget(self.cid, 2, 1)
+
+        # -------- Routage --------
+        grid.addWidget(QLabel("Nb routeurs :"), 0, 2)
         self.nb = QSpinBox()
         self.nb.setMinimum(3)
         self.nb.setValue(3)
-        grid.addWidget(self.nb, 2, 3)
+        grid.addWidget(self.nb, 0, 3)
 
-        grid.addWidget(QLabel("Destinataire :"), 3, 0)
+        grid.addWidget(QLabel("Destinataire :"), 1, 2)
         self.dest = QComboBox()
-        self.dest.addItems(["A", "B", "C"])
-        grid.addWidget(self.dest, 3, 1)
+        grid.addWidget(self.dest, 1, 3)
 
-        # ============================================================
-        #   MESSAGE
-        # ============================================================
-        grid.addWidget(QLabel("Message :"), 4, 0, 1, 4)
+        # -------- Message --------
+        grid.addWidget(QLabel("Message :"), 3, 0, 1, 4)
         self.msg = QTextEdit()
-        grid.addWidget(self.msg, 5, 0, 1, 4)
+        grid.addWidget(self.msg, 4, 0, 1, 4)
 
-        # ============================================================
-        #   BOUTON ENVOYER
-        # ============================================================
+        # -------- Bouton --------
         self.btn = QPushButton("ENVOYER")
         self.btn.clicked.connect(self.send_message)
-        grid.addWidget(self.btn, 6, 0, 1, 4, alignment=Qt.AlignCenter)
+        grid.addWidget(self.btn, 5, 0, 1, 4, alignment=Qt.AlignCenter)
 
-        # ============================================================
-        #   MESSAGES REÇUS
-        # ============================================================
-        grid.addWidget(QLabel("Messages reçus :"), 7, 0, 1, 4)
+        # -------- Réception --------
+        grid.addWidget(QLabel("Messages reçus :"), 6, 0, 1, 4)
         self.received = QTextEdit()
         self.received.setReadOnly(True)
-        grid.addWidget(self.received, 8, 0, 1, 4)
+        grid.addWidget(self.received, 7, 0, 1, 4)
 
-        # ============================================================
-        #   LOGS
-        # ============================================================
-        grid.addWidget(QLabel("Logs :"), 9, 0, 1, 4)
+        # -------- Logs --------
+        grid.addWidget(QLabel("Logs :"), 8, 0, 1, 4)
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
-        grid.addWidget(self.logs, 10, 0, 1, 4)
+        grid.addWidget(self.logs, 9, 0, 1, 4)
 
+        self.server_socket = None
         self.started = False
 
-    # ============================================================
-    #   OUTILS AFFICHAGE
-    # ============================================================
+    # --------------------------------------------------
     def log(self, txt):
         self.logs.append(txt)
 
     def show_received(self, frm, msg):
         self.received.append(f"[{frm}] {msg}")
 
-    # ============================================================
-    #   THREAD ÉCOUTE
-    # ============================================================
+    # --------------------------------------------------
     def start_client(self):
         if self.started:
             return
 
-        cid = self.cid.text().upper()
-        host = self.ip.text()
-        port = int(self.port.text())
-
-        threading.Thread(
-            target=listen_thread,
-            args=(self, cid, host, port),
-            daemon=True
-        ).start()
-
-        self.log("Client démarré.")
-        self.started = True
-
-    # ============================================================
-    #   ENVOI MESSAGE (Ton code existant)
-    # ============================================================
-    def send_message(self):
-        self.start_client()
-
-        cid = self.cid.text().upper()
         mip = self.master_ip.text()
         mport = int(self.master_port.text())
 
-        dest = self.dest.currentText().upper()
-        msg = self.msg.toPlainText().strip()
+        serv = socket.socket()
+        serv.bind(("0.0.0.0", 0))
+        serv.listen()
+        self.server_socket = serv
 
+        real_port = serv.getsockname()[1]
+        advertise_host = detect_local_ip(mip, mport)
+
+        # register client
+        s = socket.socket()
+        s.connect((mip, mport))
+        send_packet(s, f"REGISTER_CLIENT_DYNAMIC|{advertise_host}|{real_port}")
+        rep = recv_packet(s)
+        s.close()
+
+        cid = "C?"
+        if rep and rep.startswith("ASSIGNED_CLIENT|"):
+            cid = rep.split("|", 1)[1]
+
+        self.cid.setText(cid)
+        self.log(f"[CLIENT {cid}] En écoute sur {advertise_host}:{real_port}")
+
+        threading.Thread(
+            target=listen_thread,
+            args=(self, serv),
+            daemon=True
+        ).start()
+
+        self.refresh_destinations()
+        self.started = True
+
+    # --------------------------------------------------
+    def refresh_destinations(self):
+        mip = self.master_ip.text()
+        mport = int(self.master_port.text())
+
+        s = socket.socket()
+        s.connect((mip, mport))
+        send_packet(s, "CLIENT_LIST_REQUEST")
+        rep = recv_packet(s)
+        s.close()
+
+        self.dest.clear()
+        if rep and rep.startswith("CLIENT_LIST|"):
+            ids = rep.split("|", 1)[1].split(";")
+            self.dest.addItems(ids)
+
+    # --------------------------------------------------
+    def send_message(self):
+        self.start_client()
+
+        msg = self.msg.toPlainText().strip()
         if not msg:
+            self.log("⚠️ Message vide.")
             return
 
-        # ---- trouver l'IP du destinataire ----
-        d_ip, d_port = load_node(dest)
+        mip = self.master_ip.text()
+        mport = int(self.master_port.text())
 
-        # ---- récupérer les routeurs ----
+        dest = self.dest.currentText()
         routers = get_routers(mip, mport)
+
         if len(routers) < 3:
-            self.log("[ERREUR] Pas assez de routeurs.")
+            self.log("❌ Pas assez de routeurs.")
             return
 
         nb = self.nb.value()
+        if nb > len(routers):
+            self.log("❌ Trop de routeurs demandés.")
+            return
+
         path = random.sample(routers, nb)
+        self.log("Chemin : " + " → ".join([r[0] for r in path]))
 
-        self.log("Chemin choisi : " + " → ".join([r[0] for r in path]))
+        # destination
+        s = socket.socket()
+        s.connect((mip, mport))
+        send_packet(s, f"CLIENT_INFO_REQUEST|{dest}")
+        rep = recv_packet(s)
+        s.close()
 
-        # ---- couche finale ----
+        if not rep or not rep.startswith("CLIENT_INFO|OK|"):
+            self.log(f"❌ Destination inconnue : {dest}")
+            return
+
+        _, _, d_ip, d_port = rep.split("|")
+
+        cid = self.cid.text()
+
         plain = f"{d_ip}|{d_port}|{cid}|{msg}"
         cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
 
-        # ---- couches intermédiaires ----
         for i in range(nb - 2, -1, -1):
-            nh, np = path[i+1][1], path[i+1][2]
-            layer = f"{nh}|{np}|{cipher}"
-            cipher = encrypt_str(layer, (path[i][3], path[i][4]))
+            nh, np = path[i + 1][1], path[i + 1][2]
+            cipher = encrypt_str(f"{nh}|{np}|{cipher}", (path[i][3], path[i][4]))
 
         entry = path[0]
+        s = socket.socket()
+        s.connect((entry[1], entry[2]))
+        send_packet(s, "ONION|" + cipher)
+        s.close()
 
-        # ---- envoi ----
-        try:
-            s = socket.socket()
-            s.connect((entry[1], entry[2]))
-            send_packet(s, "ONION|" + cipher)
-            s.close()
-
-            self.log("Message envoyé ✔")
-            self.msg.clear()
-
-        except Exception as e:
-            self.log("Erreur envoi : " + str(e))
+        self.log("Message envoyé ✔")
+        self.msg.clear()
 
 
 # ============================================================

@@ -175,11 +175,11 @@ def main():
             line = input("> ").strip()
 
             if not line:
-                print("⚠️ Format invalide. Exemple : C2: Bonjour")
+                print("Format invalide. Exemple : C2: Bonjour")
                 continue
 
             if ":" not in line:
-                print("⚠️ Format invalide. Exemple : C2: Bonjour")
+                print("Format invalide. Exemple : C2: Bonjour")
                 continue
 
             dest, msg = line.split(":", 1)
@@ -187,12 +187,12 @@ def main():
             msg = msg.strip()
 
             if not dest or not msg:
-                print("⚠️ Format invalide. Exemple : C2: Bonjour")
+                print("Format invalide. Exemple : C2: Bonjour")
                 continue
 
             resolved = resolve_client(master_h, master_p, dest)
             if not resolved:
-                print(f"❌ Destination inconnue : {dest}")
+                print(f"Destination inconnue : {dest}")
                 continue
             d_host, d_port = resolved
 
