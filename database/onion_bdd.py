@@ -4,9 +4,6 @@ from pathlib import Path
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
 
-# -----------------------------------------------------
-# Lit noeuds.txt → (host, port)
-# -----------------------------------------------------
 def load_node(node_id: str):
     with CONFIG.open() as f:
         for line in f:
@@ -21,9 +18,6 @@ def load_node(node_id: str):
     raise RuntimeError(f"Noeud {node_id} introuvable dans noeuds.txt.")
 
 
-# -----------------------------------------------------
-# Connexion MariaDB
-# -----------------------------------------------------
 def get_connection():
     host, port = load_node("DB")
 
@@ -42,14 +36,10 @@ def get_connection():
         raise
 
 
-# -----------------------------------------------------
-# Création tables utiles
-# -----------------------------------------------------
 def init_database():
     conn = get_connection()
     cur = conn.cursor()
 
-    # Table des routeurs UNIQUEMENT
     cur.execute("""
         CREATE TABLE IF NOT EXISTS routers (
             id INT PRIMARY KEY AUTO_INCREMENT,
@@ -65,9 +55,6 @@ def init_database():
     print("[DB] Base initialisée.")
 
 
-# -----------------------------------------------------
-# RESET ROUTERS (au lancement)
-# -----------------------------------------------------
 def reset_routers():
     conn = get_connection()
     cur = conn.cursor()
@@ -77,13 +64,22 @@ def reset_routers():
     print("[DB] Table routers vidée.")
 
 
-# -----------------------------------------------------
-# ROUTERS : add + get
-# -----------------------------------------------------
+def delete_router(name: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM routers WHERE name = ?;", (name,))
+    conn.commit()
+    conn.close()
+
+
 def add_router(name: str, ip: str, port: int, public_key: str):
+    """
+    Remplace si le même name existe déjà (évite doublons quand on relance un routeur).
+    """
     conn = get_connection()
     cur = conn.cursor()
 
+    cur.execute("DELETE FROM routers WHERE name = ?;", (name,))
     cur.execute("""
         INSERT INTO routers (name, ip, port, public_key)
         VALUES (?, ?, ?, ?);

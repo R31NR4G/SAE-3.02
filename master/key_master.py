@@ -5,16 +5,14 @@ from pathlib import Path
 from database.onion_bdd import (
     add_router,
     get_routers,
-    reset_routers
+    reset_routers,
+    delete_router
 )
 
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
-# ---------------------------
-# Fallback mémoire (si BDD KO)
-# ---------------------------
-routers_mem = []  # list of (rid, host, port, pub)
-clients_mem = {}  # cid -> (host, port)
+routers_mem = []      # fallback si BDD KO : list (rid, host, port, pub)
+clients_mem = {}      # cid -> (host, port)
 mem_lock = threading.Lock()
 
 
@@ -63,26 +61,23 @@ def recv_packet(sock: socket.socket):
 
 
 def safe_reset_routers():
-    """Reset BDD si possible, sinon reset fallback mémoire."""
     try:
         reset_routers()
         return True
     except Exception as e:
-        print("[MASTER] BDD indisponible (reset_routers) -> fallback mémoire. Erreur:", e)
+        print("[MASTER] BDD indisponible (reset) -> fallback mémoire. Erreur:", e)
         with mem_lock:
             routers_mem.clear()
         return False
 
 
 def safe_add_router(rid: str, host: str, port: int, pub: str):
-    """Ajoute routeur en BDD si possible, sinon en mémoire."""
     try:
         add_router(rid, host, port, pub)
         return True
     except Exception as e:
-        print("[MASTER] BDD indisponible (add_router) -> fallback mémoire. Erreur:", e)
+        print("[MASTER] BDD indisponible (add) -> fallback mémoire. Erreur:", e)
         with mem_lock:
-            # Remplace si même RID
             for i, (rr, _, _, _) in enumerate(routers_mem):
                 if rr.upper() == rid.upper():
                     routers_mem[i] = (rid, host, port, pub)
@@ -92,12 +87,22 @@ def safe_add_router(rid: str, host: str, port: int, pub: str):
         return False
 
 
-def safe_get_routers():
-    """Lit la liste routeurs depuis BDD, sinon fallback mémoire."""
+def safe_delete_router(rid: str):
     try:
-        return get_routers()  # attendu: list of (rid, host, port, pub)
+        delete_router(rid)
+        return True
     except Exception as e:
-        print("[MASTER] BDD indisponible (get_routers) -> fallback mémoire. Erreur:", e)
+        print("[MASTER] BDD indisponible (delete) -> fallback mémoire. Erreur:", e)
+        with mem_lock:
+            routers_mem[:] = [t for t in routers_mem if t[0].upper() != rid.upper()]
+        return False
+
+
+def safe_get_routers():
+    try:
+        return get_routers()
+    except Exception as e:
+        print("[MASTER] BDD indisponible (get) -> fallback mémoire. Erreur:", e)
         with mem_lock:
             return list(routers_mem)
 
@@ -105,7 +110,6 @@ def safe_get_routers():
 def allocate_router_id() -> str:
     routers = safe_get_routers()
     used = set(rid.upper() for rid, host, port, pub in routers)
-
     i = 1
     while True:
         rid = f"R{i}"
@@ -125,6 +129,37 @@ def allocate_client_id() -> str:
         i += 1
 
 
+def is_router_alive(host: str, port: int, timeout=0.4) -> bool:
+    """
+    Ping TCP léger: on se connecte et on envoie PING.
+    Le routeur répond PONG.
+    """
+    try:
+        s = socket.socket()
+        s.settimeout(timeout)
+        s.connect((host, port))
+        send_packet(s, "PING")
+        rep = recv_packet(s)
+        s.close()
+        return rep == "PONG"
+    except:
+        return False
+
+
+def prune_dead_routers():
+    routers = safe_get_routers()
+    dead = []
+    for rid, host, port, pub in routers:
+        if not is_router_alive(host, int(port)):
+            dead.append(rid)
+
+    for rid in dead:
+        safe_delete_router(rid)
+
+    if dead:
+        print(f"[MASTER] Nettoyage routeurs morts : {', '.join(dead)}")
+
+
 def handle_client(conn, addr):
     try:
         while True:
@@ -132,47 +167,60 @@ def handle_client(conn, addr):
             if not pkt:
                 break
 
-            # 1) CLIENT -> demande liste routeurs
+            # 0) ROUTEUR -> désenregistrement propre
+            if pkt.startswith("UNREGISTER|"):
+                _, rid = pkt.split("|", 1)
+                rid = rid.strip().upper()
+                safe_delete_router(rid)
+                send_packet(conn, "OK")
+                print(f"[MASTER] Routeur {rid} désenregistré.")
+                continue
+
+            # 1) CLIENT -> liste routeurs (on prune avant de répondre)
             if pkt == "ROUTER_INFO_REQUEST":
+                prune_dead_routers()
                 routers = safe_get_routers()
                 parts = []
                 for rid, host, port, pub in routers:
                     n, e = pub.split(",")
                     parts.append(f"{rid},{host},{port},{n},{e}")
                 send_packet(conn, "ROUTER_INFO|" + ";".join(parts))
+                continue
 
             # 2) ROUTEUR statique
-            elif pkt.startswith("REGISTER|"):
+            if pkt.startswith("REGISTER|"):
                 _, rid, h, p, n, e = pkt.split("|")
                 pub = f"{n},{e}"
                 safe_add_router(rid, h, int(p), pub)
+                send_packet(conn, "OK")
                 print(f"[MASTER] Routeur {rid} enregistré : {h}:{p}")
+                continue
 
             # 3) ROUTEUR dynamique
-            elif pkt.startswith("REGISTER_DYNAMIC|"):
+            if pkt.startswith("REGISTER_DYNAMIC|"):
                 _, h, p, n, e = pkt.split("|")
                 rid = allocate_router_id()
                 pub = f"{n},{e}"
                 safe_add_router(rid, h, int(p), pub)
                 send_packet(conn, f"ASSIGNED|{rid}")
                 print(f"[MASTER] Routeur {rid} (dyn) enregistré : {h}:{p}")
+                continue
 
             # 4) CLIENT dynamique
-            elif pkt.startswith("REGISTER_CLIENT_DYNAMIC|"):
-                # REGISTER_CLIENT_DYNAMIC|host|port
+            if pkt.startswith("REGISTER_CLIENT_DYNAMIC|"):
                 _, h, p = pkt.split("|")
                 cid = allocate_client_id()
                 with mem_lock:
                     clients_mem[cid] = (h, int(p))
                 send_packet(conn, f"ASSIGNED_CLIENT|{cid}")
                 print(f"[MASTER] Client {cid} (dyn) enregistré : {h}:{p}")
+                continue
 
-            # 5) Résolution client (statique/dynamique)
-            elif pkt.startswith("CLIENT_INFO_REQUEST|"):
+            # 5) Résolution client
+            if pkt.startswith("CLIENT_INFO_REQUEST|"):
                 _, dest_id = pkt.split("|", 1)
                 dest_id = dest_id.strip().upper()
 
-                # d'abord noeuds.txt (mode statique A/B/C)
                 try:
                     h, p = load_node(dest_id)
                     send_packet(conn, f"CLIENT_INFO|OK|{h}|{p}")
@@ -180,7 +228,6 @@ def handle_client(conn, addr):
                 except:
                     pass
 
-                # sinon mémoire (dyn)
                 with mem_lock:
                     info = clients_mem.get(dest_id)
 
@@ -189,19 +236,21 @@ def handle_client(conn, addr):
                     send_packet(conn, f"CLIENT_INFO|OK|{h}|{p}")
                 else:
                     send_packet(conn, "CLIENT_INFO|NOT_FOUND")
+                continue
 
-            else:
-                print("[MASTER] Message inconnu :", pkt)
+            # Sinon
+            send_packet(conn, "ERR|UNKNOWN_COMMAND")
+            print("[MASTER] Message inconnu :", pkt)
 
     except Exception as e:
         print("[MASTER] Erreur handle_client:", e)
     finally:
+        # On n'affiche plus "Connexion fermée" en permanence (c'était du spam)
         conn.close()
-        print("[MASTER] Connexion fermée :", addr)
 
 
 def main():
-    _, port = load_node("MASTER")  # on ignore l'IP du fichier
+    _, port = load_node("MASTER")
     safe_reset_routers()
 
     serv = socket.socket()

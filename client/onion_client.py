@@ -7,9 +7,6 @@ import os
 from crypto.onion_rsa import encrypt_str
 
 
-# -----------------------------------------------------
-# OUTILS TCP
-# -----------------------------------------------------
 def send_packet(sock, payload: str):
     data = payload.encode()
     header = str(len(data)).encode() + b"\n"
@@ -27,6 +24,9 @@ def recv_packet(sock):
     try:
         size = int(size_bytes.strip())
     except ValueError:
+        return None
+
+    if size <= 0 or size > 20000:
         return None
 
     data = b""
@@ -49,12 +49,12 @@ def detect_local_ip(master_h, master_p):
         return "127.0.0.1"
 
 
-# -----------------------------------------------------
-# ÉCOUTE DES MESSAGES ENTRANTS
-# -----------------------------------------------------
 def listen_incoming(my_id_ref, server_socket):
     while True:
-        conn, _ = server_socket.accept()
+        try:
+            conn, _ = server_socket.accept()
+        except OSError:
+            return
         pkt = recv_packet(conn)
         conn.close()
 
@@ -65,9 +65,6 @@ def listen_incoming(my_id_ref, server_socket):
             print("> ", end="", flush=True)
 
 
-# -----------------------------------------------------
-# COMMUNICATION MASTER
-# -----------------------------------------------------
 def register_client_dynamic(master_h, master_p, advertise_host, listen_port):
     try:
         s = socket.socket()
@@ -120,11 +117,7 @@ def get_routers(master_h, master_p):
         return []
 
 
-# -----------------------------------------------------
-# CLIENT PRINCIPAL
-# -----------------------------------------------------
 def main():
-    # ---- CONFIG MASTER ----
     master_h = "127.0.0.1"
     master_p = 5000
 
@@ -137,8 +130,8 @@ def main():
     if os.getenv("MASTER_PORT"):
         master_p = int(os.getenv("MASTER_PORT"))
 
-    # ---- SERVEUR LOCAL CLIENT ----
     serv = socket.socket()
+    serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serv.bind(("0.0.0.0", 0))
     serv.listen()
 
@@ -146,87 +139,91 @@ def main():
     advertise_host = detect_local_ip(master_h, master_p)
 
     my_id_ref = [None]
-    threading.Thread(
-        target=listen_incoming,
-        args=(my_id_ref, serv),
-        daemon=True
-    ).start()
+    t = threading.Thread(target=listen_incoming, args=(my_id_ref, serv), daemon=True)
+    t.start()
 
     cid = register_client_dynamic(master_h, master_p, advertise_host, real_port) or "C?"
     my_id_ref[0] = cid
 
     print(f"[CLIENT {cid}] En écoute sur {advertise_host}:{real_port}")
-    print("Format : DEST: message\n")
+    print("Format : DEST: message (ex: C2: salut)\n")
 
-    # ---- NOMBRE DE ROUTEURS (PERSISTANT) ----
     hop_count = 3
 
-    while True:
-        # --- choix interactif du nombre de routeurs ---
-        routers = get_routers(master_h, master_p)
-        max_hops = len(routers)
+    try:
+        while True:
+            routers = get_routers(master_h, master_p)
+            max_hops = len(routers)
 
-        if max_hops < 3:
-            print("Pas assez de routeurs disponibles (min 3).")
-            continue
-
-        choice = input(
-            f"Nombre de routeurs [min=3 | max={max_hops}] (Entrée = {hop_count}) : "
-        ).strip()
-
-        if choice:
-            try:
-                new_count = int(choice)
-                if 3 <= new_count <= max_hops:
-                    hop_count = new_count
-                else:
-                    print("Valeur hors limites.")
-                    continue
-            except ValueError:
-                print("Veuillez entrer un nombre valide.")
+            if max_hops < 3:
+                print("Pas assez de routeurs disponibles (min 3).")
                 continue
 
-        # --- saisie message ---
-        line = input("> ").strip()
-        if ":" not in line:
-            continue
+            choice = input(f"Nombre de routeurs [min=3 | max={max_hops}] (Entrée = {hop_count}) : ").strip()
+            if choice:
+                try:
+                    new_count = int(choice)
+                    if 3 <= new_count <= max_hops:
+                        hop_count = new_count
+                    else:
+                        print("Valeur hors limites.")
+                        continue
+                except ValueError:
+                    print("Veuillez entrer un nombre valide.")
+                    continue
 
-        dest, msg = line.split(":", 1)
-        dest = dest.strip().upper()
-        msg = msg.strip()
+            line = input("> ").strip()
 
-        # --- résolution destination ---
-        resolved = resolve_client(master_h, master_p, dest)
-        if not resolved:
-            print("Destination inconnue.")
-            continue
-        d_host, d_port = resolved
+            if not line:
+                print("⚠️ Format invalide. Exemple : C2: Bonjour")
+                continue
 
-        # --- sélection aléatoire des routeurs ---
-        path = random.sample(routers, hop_count)
+            if ":" not in line:
+                print("⚠️ Format invalide. Exemple : C2: Bonjour")
+                continue
 
-        # --- construction onion ---
-        plain = f"{d_host}|{d_port}|{cid}|{msg}"
-        last = path[-1]
-        cipher = encrypt_str(plain, (last[3], last[4]))
+            dest, msg = line.split(":", 1)
+            dest = dest.strip().upper()
+            msg = msg.strip()
 
-        for i in range(len(path) - 2, -1, -1):
-            nh, np = path[i + 1][1], path[i + 1][2]
-            cipher = encrypt_str(
-                f"{nh}|{np}|{cipher}",
-                (path[i][3], path[i][4])
-            )
+            if not dest or not msg:
+                print("⚠️ Format invalide. Exemple : C2: Bonjour")
+                continue
 
-        # --- envoi au routeur d'entrée ---
-        entry = path[0]
+            resolved = resolve_client(master_h, master_p, dest)
+            if not resolved:
+                print(f"❌ Destination inconnue : {dest}")
+                continue
+            d_host, d_port = resolved
+
+            path = random.sample(routers, hop_count)
+
+            plain = f"{d_host}|{d_port}|{cid}|{msg}"
+            last = path[-1]
+            cipher = encrypt_str(plain, (last[3], last[4]))
+
+            for i in range(len(path) - 2, -1, -1):
+                nh, np = path[i + 1][1], path[i + 1][2]
+                cipher = encrypt_str(f"{nh}|{np}|{cipher}", (path[i][3], path[i][4]))
+
+            entry = path[0]
+            try:
+                s = socket.socket()
+                s.connect((entry[1], entry[2]))
+                send_packet(s, "ONION|" + cipher)
+                s.close()
+                print("[CLIENT] Message envoyé.")
+            except Exception as e:
+                print(f"[ERREUR] Envoi impossible : {e}")
+
+    except KeyboardInterrupt:
+        print(f"\n[CLIENT {cid}] Arrêt demandé.")
+
+    finally:
         try:
-            s = socket.socket()
-            s.connect((entry[1], entry[2]))
-            send_packet(s, "ONION|" + cipher)
-            s.close()
-            print("[CLIENT] Message envoyé.")
-        except Exception as e:
-            print(f"[ERREUR] Envoi impossible : {e}")
+            serv.close()
+        except:
+            pass
 
 
 if __name__ == "__main__":
