@@ -1,40 +1,18 @@
-# ======================================================
-# Outils communs client (console + GUI)
-# ======================================================
-
+# client/onion_tools.py
 import socket
-from pathlib import Path
-
-# Chemin vers noeuds.txt (comme dans ton client)
-CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
-
-
-# ------------------------------------------------------
-# Charger un noeud depuis noeuds.txt
-# ------------------------------------------------------
-def load_node(node_id):
-    with CONFIG.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            nid, host, port = line.split(";")
-            if nid.upper() == node_id.upper():
-                return host, int(port)
-    raise RuntimeError(f"Noeud {node_id} introuvable.")
 
 
 # ------------------------------------------------------
 # Envoi paquet ASCII length + \n + payload
 # ------------------------------------------------------
-def send_packet(sock, payload):
+def send_packet(sock, payload: str):
     data = payload.encode()
     header = str(len(data)).encode() + b"\n"
     sock.sendall(header + data)
 
 
 # ------------------------------------------------------
-# Réception paquet ASCII length
+# Réception paquet ASCII length + payload
 # ------------------------------------------------------
 def recv_packet(sock):
     size_bytes = b""
@@ -64,25 +42,24 @@ def recv_packet(sock):
 
 # ------------------------------------------------------
 # Demande au MASTER la liste des routeurs
+# Format attendu :
+#   ROUTER_INFO|RID,IP,PORT,N,E;RID,IP,PORT,N,E;...
+# Retour : [(rid, host, port, n, e), ...]
 # ------------------------------------------------------
 def get_routers(master_host, master_port):
     routers = []
+    s = None
     try:
         s = socket.socket()
-        s.settimeout(2)   # ⭐ TRÈS IMPORTANT
+        s.settimeout(2)
         s.connect((master_host, master_port))
         send_packet(s, "ROUTER_INFO_REQUEST")
         resp = recv_packet(s)
-        s.close()
 
-        if not resp:
-            return []
-
-        if not resp.startswith("ROUTER_INFO|"):
+        if not resp or not resp.startswith("ROUTER_INFO|"):
             return []
 
         data = resp.split("|", 1)[1]
-
         for item in data.split(";"):
             if not item:
                 continue
@@ -90,12 +67,15 @@ def get_routers(master_host, master_port):
                 rid, h, p, n, e = item.split(",")
                 routers.append((rid, h, int(p), int(n), int(e)))
             except:
-                # ignore entrée malformée
                 continue
 
         return routers
 
-    except Exception as e:
-        # debug possible si besoin
-        # print("[CLIENT] Erreur get_routers:", e)
+    except:
         return []
+    finally:
+        try:
+            if s:
+                s.close()
+        except:
+            pass
