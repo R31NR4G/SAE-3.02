@@ -1,127 +1,237 @@
+# gui/master_gui.py
 import sys
 import socket
 import threading
-import time
+from pathlib import Path
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
-    QGridLayout, QLabel, QTextEdit, QListWidget
+    QGridLayout, QLabel, QPushButton,
+    QTextEdit, QLineEdit
 )
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from client.onion_tools import send_packet, recv_packet, load_node
-from database.onion_bdd import get_routers
+from client.onion_tools import send_packet, recv_packet
 
 
 # ======================================================
-# EMETTEUR DE LOGS (THREAD SAFE)
+# Chargement noeuds.txt (si tu veux utiliser des IDs)
 # ======================================================
-class LogEmitter(QObject):
-    log_signal = pyqtSignal(str)
+CONFIG = Path(__file__).parents[1] / "config" / "noeuds.txt"
+
+
+def load_node(node_id):
+    """Lit config/noeuds.txt au format: ID;HOST;PORT"""
+    with CONFIG.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            nid, host, port = line.split(";")
+            if nid.upper() == node_id.upper():
+                return host, int(port)
+    raise RuntimeError(f"Noeud {node_id} introuvable.")
 
 
 # ======================================================
-# INTERFACE MASTER GUI (MONITOR)
+# Master serveur (compatible client)
+# ======================================================
+class MasterState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.client_counter = 0
+        self.router_counter = 0
+        self.clients = {}   # CID -> (ip, port)
+        self.routers = {}   # RID -> (ip, port, n, e)
+
+
+class Signals(QObject):
+    log = pyqtSignal(str)
+    refresh = pyqtSignal()
+
+
+class MasterServer:
+    def __init__(self, host, port, signals: Signals, state: MasterState):
+        self.host = host
+        self.port = port
+        self.sig = signals
+        self.state = state
+
+        self._sock = None
+        self._running = False
+
+    def start(self):
+        if self._running:
+            return
+
+        self._running = True
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def stop(self):
+        self._running = False
+        try:
+            if self._sock:
+                self._sock.close()
+        except:
+            pass
+
+    def _run(self):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((self.host, self.port))
+        s.listen()
+        self._sock = s
+
+        self.sig.log.emit(f"[MASTER] Écoute sur {self.host}:{self.port}")
+
+        while self._running:
+            try:
+                conn, addr = s.accept()
+                threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+            except:
+                # socket fermé / arrêt
+                break
+
+        self.sig.log.emit("[MASTER] Arrêt.")
+
+    def _handle_client(self, conn, addr):
+        try:
+            pkt = recv_packet(conn)
+            if not pkt:
+                return
+
+            # -------------------------
+            # REGISTER_CLIENT_DYNAMIC|ip|port
+            # Réponse: CLIENT_REGISTERED|C1
+            # -------------------------
+            if pkt.startswith("REGISTER_CLIENT_DYNAMIC|"):
+                parts = pkt.split("|")
+                if len(parts) != 3:
+                    send_packet(conn, "ERROR|BAD_REGISTER_CLIENT")
+                    return
+
+                ip = parts[1]
+                port = int(parts[2])
+
+                with self.state.lock:
+                    self.state.client_counter += 1
+                    cid = f"C{self.state.client_counter}"
+                    self.state.clients[cid] = (ip, port)
+
+                send_packet(conn, f"CLIENT_REGISTERED|{cid}")
+                self.sig.log.emit(f"[MASTER] Client enregistré: {cid} -> {ip}:{port}")
+                self.sig.refresh.emit()
+                return
+
+            # -------------------------
+            # CLIENT_INFO_REQUEST|C2
+            # Réponse: CLIENT_INFO|OK|ip|port
+            # -------------------------
+            if pkt.startswith("CLIENT_INFO_REQUEST|"):
+                parts = pkt.split("|", 1)
+                if len(parts) != 2:
+                    send_packet(conn, "CLIENT_INFO|ERR|BAD_REQUEST")
+                    return
+
+                dest = parts[1].strip().upper()
+
+                with self.state.lock:
+                    info = self.state.clients.get(dest)
+
+                if not info:
+                    send_packet(conn, "CLIENT_INFO|ERR|UNKNOWN")
+                    return
+
+                ip, port = info
+                send_packet(conn, f"CLIENT_INFO|OK|{ip}|{port}")
+                return
+
+            # -------------------------
+            # ROUTER_REGISTER|ip|port|n|e
+            # Réponse: ROUTER_REGISTERED|R1
+            # (si tes routeurs font autrement, dis-moi le format exact et j’adapte)
+            # -------------------------
+            if pkt.startswith("ROUTER_REGISTER|"):
+                parts = pkt.split("|")
+                if len(parts) != 5:
+                    send_packet(conn, "ERROR|BAD_REGISTER_ROUTER")
+                    return
+
+                ip = parts[1]
+                port = int(parts[2])
+                n = int(parts[3])
+                e = int(parts[4])
+
+                with self.state.lock:
+                    self.state.router_counter += 1
+                    rid = f"R{self.state.router_counter}"
+                    self.state.routers[rid] = (ip, port, n, e)
+
+                send_packet(conn, f"ROUTER_REGISTERED|{rid}")
+                self.sig.log.emit(f"[MASTER] Routeur enregistré: {rid} -> {ip}:{port}")
+                self.sig.refresh.emit()
+                return
+
+            # -------------------------
+            # ROUTER_INFO_REQUEST
+            # Réponse: ROUTER_INFO|RID,IP,PORT,N,E;RID,IP,PORT,N,E;...
+            # -------------------------
+            if pkt.strip() == "ROUTER_INFO_REQUEST":
+                with self.state.lock:
+                    items = []
+                    for rid, (ip, port, n, e) in self.state.routers.items():
+                        items.append(f"{rid},{ip},{port},{n},{e}")
+                send_packet(conn, "ROUTER_INFO|" + ";".join(items))
+                return
+
+            # -------------------------
+            # Sinon
+            # -------------------------
+            send_packet(conn, "ERROR|UNKNOWN_CMD")
+
+        except Exception as ex:
+            try:
+                self.sig.log.emit(f"[MASTER] Erreur: {ex}")
+            except:
+                pass
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+# ======================================================
+# GUI
 # ======================================================
 class MasterGUI(QMainWindow):
-
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MASTER SAE 3.02 — Monitor")
+        self.setWindowTitle("Master SAE 3.02")
 
-        self.setStyleSheet("""
-            QWidget { background-color: #2B2D31; color: #DCDDDE; font-size: 14px; }
-            QListWidget, QTextEdit {
-                background-color: #1E1F22;
-                border: 1px solid #111;
-            }
-        """)
+        self.state = MasterState()
+        self.sig = Signals()
+        self.sig.log.connect(self._log)
+        self.sig.refresh.connect(self._refresh_lists)
 
-        # ---- EMETTEUR ----
-        self.emitter = LogEmitter()
-        self.emitter.log_signal.connect(self._log_gui)
+        self.server = None
 
         root = QWidget()
         grid = QGridLayout(root)
         self.setCentralWidget(root)
 
-        grid.addWidget(QLabel("Routeurs enregistrés"), 0, 0)
-        self.router_list = QListWidget()
-        grid.addWidget(self.router_list, 1, 0)
+        grid.addWidget(QLabel("Host"), 0, 0)
+        self.host_in = QLineEdit("0.0.0.0")
+        grid.addWidget(self.host_in, 0, 1)
 
-        grid.addWidget(QLabel("Clients enregistrés"), 2, 0)
-        self.client_list = QListWidget()
-        grid.addWidget(self.client_list, 3, 0)
+        grid.addWidget(QLabel("Port"), 0, 2)
+        self.port_in = QLineEdit("5000")
+        grid.addWidget(self.port_in, 0, 3)
 
-        grid.addWidget(QLabel("Logs Monitor"), 0, 1)
-        self.logs = QTextEdit()
-        self.logs.setReadOnly(True)
-        grid.addWidget(self.logs, 1, 1, 3, 1)
+        self.btn_start = QPushButton("Démarrer")
+        self.btn_start.clicked.connect(self.start_master)
+        grid.addWidget(self.btn_start, 0, 4)
 
-        # ---- CONFIG MASTER ----
-        self.master_host = "127.0.0.1"
-        self.master_port = 5000
-        try:
-            h, p = load_node("MASTER")
-            self.master_host, self.master_port = h, p
-        except:
-            pass
-
-        # ---- THREAD REFRESH ----
-        threading.Thread(target=self.refresh_loop, daemon=True).start()
-        self.emitter.log_signal.emit("[MONITOR] GUI démarrée.")
-
-    # ==================================================
-    # LOG THREAD SAFE
-    # ==================================================
-    def _log_gui(self, txt):
-        self.logs.append(txt)
-
-    def log(self, txt):
-        self.emitter.log_signal.emit(txt)
-
-    # ==================================================
-    # REFRESH LOOP
-    # ==================================================
-    def refresh_loop(self):
-        while True:
-            time.sleep(2)
-            self.refresh_routers()
-            self.refresh_clients()
-
-    def refresh_routers(self):
-        try:
-            routers = get_routers()
-            self.router_list.clear()
-            for name, ip, port, _ in routers:
-                self.router_list.addItem(f"{name}  {ip}:{port}")
-        except Exception as e:
-            self.log(f"[MONITOR] Erreur lecture BDD routeurs : {e}")
-
-    def refresh_clients(self):
-        self.client_list.clear()
-        try:
-            s = socket.socket()
-            s.settimeout(0.7)
-            s.connect((self.master_host, self.master_port))
-            send_packet(s, "CLIENT_LIST_REQUEST")
-            rep = recv_packet(s)
-            s.close()
-
-            if rep and rep.startswith("CLIENT_LIST|"):
-                ids = [x for x in rep.split("|", 1)[1].split(";") if x]
-                for cid in ids:
-                    self.client_list.addItem(cid)
-
-        except Exception as e:
-            self.log(f"[MONITOR] Master injoignable : {e}")
-
-
-# ======================================================
-# MAIN
-# ======================================================
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    win = MasterGUI()
-    win.show()
-    sys.exit(app.exec())
+        self.btn_stop = QPushButton("Arrêter")
+        self.btn
