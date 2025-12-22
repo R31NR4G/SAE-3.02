@@ -18,11 +18,12 @@ def detect_local_ip(master_h, master_p):
         return "127.0.0.1"
 
 
-def listen_incoming(cid_ref, serv):
+def listen_incoming(cid, serv):
     while True:
         conn, _ = serv.accept()
         pkt = recv_packet(conn)
         conn.close()
+
         if pkt and pkt.startswith("DELIVER|"):
             _, frm, msg = pkt.split("|", 2)
             print(f"\n[{frm}] {msg}")
@@ -33,6 +34,7 @@ def main():
     master_h = os.getenv("MASTER_HOST", "127.0.0.1")
     master_p = int(os.getenv("MASTER_PORT", "5000"))
 
+    # serveur client
     serv = socket.socket()
     serv.bind(("0.0.0.0", 0))
     serv.listen()
@@ -40,6 +42,7 @@ def main():
     real_port = serv.getsockname()[1]
     advertise_host = detect_local_ip(master_h, master_p)
 
+    # register client
     s = socket.socket()
     s.connect((master_h, master_p))
     send_packet(s, f"REGISTER_CLIENT_DYNAMIC|{advertise_host}|{real_port}")
@@ -48,10 +51,11 @@ def main():
 
     cid = rep.split("|")[1] if rep else "C?"
     print(f"[CLIENT {cid}] En écoute sur {advertise_host}:{real_port}")
+    print("Format : DEST: message (ex: C1: salut)")
 
     threading.Thread(
         target=listen_incoming,
-        args=([cid], serv),
+        args=(cid, serv),
         daemon=True
     ).start()
 
@@ -60,32 +64,28 @@ def main():
     while True:
         routers = get_routers(master_h, master_p)
 
-        max_hops = len(routers)
-        if max_hops < 3:
+        if len(routers) < 3:
             print("Pas assez de routeurs.")
             continue
 
         choice = input(
-            f"Nombre de routeurs [min=3 | max={max_hops}] (Entrée = {hop_count}) : "
+            f"Nombre de routeurs [min=3 | max={len(routers)}] (Entrée = {hop_count}) : "
         ).strip()
 
         if choice:
-            try:
-                n = int(choice)
-                if not 3 <= n <= max_hops:
-                    print("Valeur hors limites.")
-                    continue
-                hop_count = n
-            except ValueError:
+            n = int(choice)
+            if not 3 <= n <= len(routers):
+                print("Valeur hors limites.")
                 continue
+            hop_count = n
 
         line = input("> ").strip()
         if ":" not in line:
-            print("Format: DEST: message")
+            print("Format invalide.")
             continue
 
         dest, msg = line.split(":", 1)
-        dest = dest.strip()
+        dest = dest.strip().upper()
         msg = msg.strip()
 
         s = socket.socket()
