@@ -11,12 +11,17 @@ from database.onion_bdd import (
 
 CONFIG = (Path(__file__).parents[1] / "config" / "noeuds.txt")
 
-routers_mem = []      # fallback mémoire
-clients_mem = {}      # cid -> (host, port)
+# -----------------------------
+# MÉMOIRE
+# -----------------------------
+routers_mem = []        # [(rid, host, port, pub)]
+clients_mem = {}        # cid -> (host, port)
 mem_lock = threading.Lock()
 
 
-# --------------------------------------------------
+# -----------------------------
+# OUTILS
+# -----------------------------
 def load_node(node_id: str):
     with CONFIG.open() as f:
         for line in f:
@@ -41,45 +46,61 @@ def recv_packet(sock: socket.socket):
         if not b:
             return None
         size_bytes += b
+
     size = int(size_bytes.strip())
     data = b""
     while len(data) < size:
         data += sock.recv(size - len(data))
+
     return data.decode(errors="ignore")
 
 
-# --------------------------------------------------
-def safe_reset_routers():
+# -----------------------------
+# SAFE DB / MÉMOIRE
+# -----------------------------
+def safe_reset_all():
+    """Reset complet au démarrage"""
     try:
         reset_routers()
     except:
+        pass
+
+    with mem_lock:
         routers_mem.clear()
+        clients_mem.clear()
 
 
 def safe_add_router(rid, host, port, pub):
     try:
         add_router(rid, host, port, pub)
     except:
-        routers_mem.append((rid, host, port, pub))
+        with mem_lock:
+            routers_mem.append((rid, host, port, pub))
 
 
 def safe_delete_router(rid):
     try:
         delete_router(rid)
     except:
-        routers_mem[:] = [r for r in routers_mem if r[0] != rid]
+        with mem_lock:
+            routers_mem[:] = [r for r in routers_mem if r[0] != rid]
 
 
 def safe_get_routers():
     try:
         return get_routers()
     except:
-        return list(routers_mem)
+        with mem_lock:
+            return list(routers_mem)
 
 
+# -----------------------------
+# ALLOCATION IDS
+# -----------------------------
 def allocate_router_id():
     routers = safe_get_routers()
     used = {r[0] for r in routers}
+
     i = 1
     while True:
         rid = f"R{i}"
@@ -89,7 +110,9 @@ def allocate_router_id():
 
 
 def allocate_client_id():
-    used = set(clients_mem.keys())
+    with mem_lock:
+        used = set(clients_mem.keys())
+
     i = 1
     while True:
         cid = f"C{i}"
@@ -98,7 +121,9 @@ def allocate_client_id():
         i += 1
 
 
-# --------------------------------------------------
+# -----------------------------
+# HANDLE CONNEXIONS
+# -----------------------------
 def handle_client(conn, addr):
     try:
         while True:
@@ -106,62 +131,73 @@ def handle_client(conn, addr):
             if not pkt:
                 break
 
-            # ROUTER LIST
+            # -------------------------
+            # ROUTER INFO REQUEST
+            # -------------------------
             if pkt == "ROUTER_INFO_REQUEST":
                 routers = safe_get_routers()
-
-                # 🔥 MODIF CLÉ : suppression doublons
-                uniq = {}
-                for r in routers:
-                    uniq[r[0]] = r
-                routers = list(uniq.values())
-
                 parts = []
                 for rid, h, p, pub in routers:
                     n, e = pub.split(",")
                     parts.append(f"{rid},{h},{p},{n},{e}")
-
                 send_packet(conn, "ROUTER_INFO|" + ";".join(parts))
                 continue
 
-            # ROUTER REGISTER DYN
+            # -------------------------
+            # ROUTER REGISTER DYNAMIC
+            # -------------------------
             if pkt.startswith("REGISTER_DYNAMIC|"):
                 _, h, p, n, e = pkt.split("|")
                 rid = allocate_router_id()
                 safe_add_router(rid, h, int(p), f"{n},{e}")
                 send_packet(conn, f"ASSIGNED|{rid}")
-                print(f"[MASTER] Routeur {rid} enregistré")
+                print(f"[MASTER] Routeur {rid} enregistré : {h}:{p}")
                 continue
 
-            # CLIENT REGISTER DYN
+            # -------------------------
+            # CLIENT REGISTER DYNAMIC
+            # -------------------------
             if pkt.startswith("REGISTER_CLIENT_DYNAMIC|"):
                 _, h, p = pkt.split("|")
                 cid = allocate_client_id()
-                clients_mem[cid] = (h, int(p))
+                with mem_lock:
+                    clients_mem[cid] = (h, int(p))
                 send_packet(conn, f"ASSIGNED_CLIENT|{cid}")
-                print(f"[MASTER] Client {cid} enregistré")
+                print(f"[MASTER] Client {cid} enregistré : {h}:{p}")
                 continue
 
+            # -------------------------
             # CLIENT RESOLUTION
+            # -------------------------
             if pkt.startswith("CLIENT_INFO_REQUEST|"):
-                _, cid = pkt.split("|", 1)
-                if cid in clients_mem:
-                    h, p = clients_mem[cid]
+                _, dest = pkt.split("|", 1)
+                dest = dest.strip().upper()
+
+                with mem_lock:
+                    info = clients_mem.get(dest)
+
+                if info:
+                    h, p = info
                     send_packet(conn, f"CLIENT_INFO|OK|{h}|{p}")
                 else:
                     send_packet(conn, "CLIENT_INFO|NOT_FOUND")
                 continue
 
+            # -------------------------
             send_packet(conn, "ERR|UNKNOWN")
 
+    except Exception as e:
+        print("[MASTER] Erreur :", e)
     finally:
         conn.close()
 
 
-# --------------------------------------------------
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
     _, port = load_node("MASTER")
-    safe_reset_routers()
+    safe_reset_all()
 
     serv = socket.socket()
     serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -169,6 +205,7 @@ def main():
     serv.listen()
 
     print(f"[MASTER] En écoute sur 0.0.0.0:{port}")
+    print("[MASTER] Prêt.")
 
     while True:
         conn, addr = serv.accept()
