@@ -23,8 +23,8 @@ def get_connection():
 
     try:
         conn = mariadb.connect(
-            user="root",
-            password="toto",
+            user="sae",
+            password="sae",
             host=host,
             port=port,
             database="onion_project"
