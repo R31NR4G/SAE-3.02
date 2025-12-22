@@ -7,11 +7,22 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QGridLayout, QLabel, QTextEdit, QListWidget
 )
+from PyQt5.QtCore import QObject, pyqtSignal
 
 from client.onion_tools import send_packet, recv_packet, load_node
 from database.onion_bdd import get_routers
 
 
+# ======================================================
+# EMETTEUR DE LOGS (THREAD SAFE)
+# ======================================================
+class LogEmitter(QObject):
+    log_signal = pyqtSignal(str)
+
+
+# ======================================================
+# INTERFACE MASTER GUI (MONITOR)
+# ======================================================
 class MasterGUI(QMainWindow):
 
     def __init__(self):
@@ -25,6 +36,10 @@ class MasterGUI(QMainWindow):
                 border: 1px solid #111;
             }
         """)
+
+        # ---- EMETTEUR ----
+        self.emitter = LogEmitter()
+        self.emitter.log_signal.connect(self._log_gui)
 
         root = QWidget()
         grid = QGridLayout(root)
@@ -43,6 +58,7 @@ class MasterGUI(QMainWindow):
         self.logs.setReadOnly(True)
         grid.addWidget(self.logs, 1, 1, 3, 1)
 
+        # ---- CONFIG MASTER ----
         self.master_host = "127.0.0.1"
         self.master_port = 5000
         try:
@@ -51,11 +67,22 @@ class MasterGUI(QMainWindow):
         except:
             pass
 
+        # ---- THREAD REFRESH ----
         threading.Thread(target=self.refresh_loop, daemon=True).start()
+        self.emitter.log_signal.emit("[MONITOR] GUI démarrée.")
 
-    def log(self, txt):
+    # ==================================================
+    # LOG THREAD SAFE
+    # ==================================================
+    def _log_gui(self, txt):
         self.logs.append(txt)
 
+    def log(self, txt):
+        self.emitter.log_signal.emit(txt)
+
+    # ==================================================
+    # REFRESH LOOP
+    # ==================================================
     def refresh_loop(self):
         while True:
             time.sleep(2)
@@ -90,6 +117,9 @@ class MasterGUI(QMainWindow):
             self.log(f"[MONITOR] Master injoignable : {e}")
 
 
+# ======================================================
+# MAIN
+# ======================================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = MasterGUI()
