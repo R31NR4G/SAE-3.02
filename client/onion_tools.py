@@ -66,26 +66,36 @@ def recv_packet(sock):
 # Demande au MASTER la liste des routeurs
 # ------------------------------------------------------
 def get_routers(master_host, master_port):
+    routers = []
     try:
         s = socket.socket()
+        s.settimeout(2)   # ⭐ TRÈS IMPORTANT
         s.connect((master_host, master_port))
         send_packet(s, "ROUTER_INFO_REQUEST")
         resp = recv_packet(s)
         s.close()
 
-        if not resp or not resp.startswith("ROUTER_INFO|"):
+        if not resp:
+            return []
+
+        if not resp.startswith("ROUTER_INFO|"):
             return []
 
         data = resp.split("|", 1)[1]
-        routers = []
 
         for item in data.split(";"):
             if not item:
                 continue
-            rid, h, p, n, e = item.split(",")
-            routers.append((rid, h, int(p), int(n), int(e)))
+            try:
+                rid, h, p, n, e = item.split(",")
+                routers.append((rid, h, int(p), int(n), int(e)))
+            except:
+                # ignore entrée malformée
+                continue
 
         return routers
 
-    except:
+    except Exception as e:
+        # debug possible si besoin
+        # print("[CLIENT] Erreur get_routers:", e)
         return []
