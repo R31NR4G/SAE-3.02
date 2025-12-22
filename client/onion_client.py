@@ -60,10 +60,6 @@ def main():
     while True:
         routers = get_routers(master_h, master_p)
 
-        # 🔥 MODIF CLÉ : suppression doublons
-        routers = {r[0]: r for r in routers}.values()
-        routers = list(routers)
-
         max_hops = len(routers)
         if max_hops < 3:
             print("Pas assez de routeurs.")
@@ -74,11 +70,14 @@ def main():
         ).strip()
 
         if choice:
-            n = int(choice)
-            if not 3 <= n <= max_hops:
-                print("Valeur hors limites.")
+            try:
+                n = int(choice)
+                if not 3 <= n <= max_hops:
+                    print("Valeur hors limites.")
+                    continue
+                hop_count = n
+            except ValueError:
                 continue
-            hop_count = n
 
         line = input("> ").strip()
         if ":" not in line:
@@ -102,12 +101,16 @@ def main():
         _, _, d_ip, d_port = rep.split("|")
 
         path = random.sample(routers, hop_count)
+
         plain = f"{d_ip}|{d_port}|{cid}|{msg}"
         cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
 
         for i in range(len(path) - 2, -1, -1):
             nh, np = path[i + 1][1], path[i + 1][2]
-            cipher = encrypt_str(f"{nh}|{np}|{cipher}", (path[i][3], path[i][4]))
+            cipher = encrypt_str(
+                f"{nh}|{np}|{cipher}",
+                (path[i][3], path[i][4])
+            )
 
         entry = path[0]
         s = socket.socket()
