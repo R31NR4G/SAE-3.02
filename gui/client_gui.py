@@ -237,7 +237,6 @@ class ClientGUI(QMainWindow):
         cid = self.cid.text().strip()
 
         path = random.sample(routers, nb)
-        self.log("Chemin : " + " → ".join([r[0] for r in path]))
 
         plain = f"{d_ip}|{d_port}|{cid}|{msg}"
         cipher = encrypt_str(plain, (path[-1][3], path[-1][4]))
