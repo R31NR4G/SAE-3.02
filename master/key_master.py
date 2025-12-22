@@ -118,6 +118,7 @@ def allocate_router_id() -> str:
         i += 1
 
 
+# ✅ CLIENT IDs SANS TROUS : C1 C3 => prochain C2
 def allocate_client_id() -> str:
     with mem_lock:
         used = set(k.upper() for k in clients_mem.keys())
@@ -130,10 +131,6 @@ def allocate_client_id() -> str:
 
 
 def is_router_alive(host: str, port: int, timeout=0.4) -> bool:
-    """
-    Ping TCP léger: on se connecte et on envoie PING.
-    Le routeur répond PONG.
-    """
     try:
         s = socket.socket()
         s.settimeout(timeout)
@@ -160,6 +157,37 @@ def prune_dead_routers():
         print(f"[MASTER] Nettoyage routeurs morts : {', '.join(dead)}")
 
 
+def is_client_alive(host: str, port: int, timeout=0.35) -> bool:
+    """
+    Test simple: on tente une connexion TCP.
+    Si le client n'écoute plus, la connexion échoue.
+    """
+    try:
+        s = socket.socket()
+        s.settimeout(timeout)
+        s.connect((host, int(port)))
+        s.close()
+        return True
+    except:
+        return False
+
+
+def prune_dead_clients():
+    with mem_lock:
+        items = list(clients_mem.items())
+
+    dead = []
+    for cid, (h, p) in items:
+        if not is_client_alive(h, p):
+            dead.append(cid)
+
+    if dead:
+        with mem_lock:
+            for cid in dead:
+                clients_mem.pop(cid, None)
+        print(f"[MASTER] Nettoyage clients morts : {', '.join(dead)}")
+
+
 def handle_client(conn, addr):
     try:
         while True:
@@ -176,6 +204,18 @@ def handle_client(conn, addr):
                 print(f"[MASTER] Routeur {rid} désenregistré.")
                 continue
 
+            # ✅ 0bis) CLIENT -> désenregistrement propre
+            if pkt.startswith("UNREGISTER_CLIENT|"):
+                _, cid = pkt.split("|", 1)
+                cid = cid.strip().upper()
+                with mem_lock:
+                    existed = cid in clients_mem
+                    clients_mem.pop(cid, None)
+                send_packet(conn, "OK")
+                if existed:
+                    print(f"[MASTER] Client {cid} désenregistré.")
+                continue
+
             # 1) CLIENT -> liste routeurs (on prune avant de répondre)
             if pkt == "ROUTER_INFO_REQUEST":
                 prune_dead_routers()
@@ -185,6 +225,14 @@ def handle_client(conn, addr):
                     n, e = pub.split(",")
                     parts.append(f"{rid},{host},{port},{n},{e}")
                 send_packet(conn, "ROUTER_INFO|" + ";".join(parts))
+                continue
+
+            # ✅ 1bis) CLIENT -> liste clients (pour GUI)
+            if pkt == "CLIENT_LIST_REQUEST":
+                prune_dead_clients()
+                with mem_lock:
+                    ids = sorted(clients_mem.keys(), key=lambda x: int(x[1:]) if x[1:].isdigit() else 10**9)
+                send_packet(conn, "CLIENT_LIST|" + ";".join(ids))
                 continue
 
             # 2) ROUTEUR statique
@@ -221,6 +269,7 @@ def handle_client(conn, addr):
                 _, dest_id = pkt.split("|", 1)
                 dest_id = dest_id.strip().upper()
 
+                # d'abord noeuds.txt (si tu gardes des clients statiques)
                 try:
                     h, p = load_node(dest_id)
                     send_packet(conn, f"CLIENT_INFO|OK|{h}|{p}")
@@ -245,7 +294,6 @@ def handle_client(conn, addr):
     except Exception as e:
         print("[MASTER] Erreur handle_client:", e)
     finally:
-        # On n'affiche plus "Connexion fermée" en permanence (c'était du spam)
         conn.close()
 
 
