@@ -118,7 +118,7 @@ def allocate_router_id() -> str:
         i += 1
 
 
-# ✅ CLIENT IDs SANS TROUS : C1 C3 => prochain C2
+# CLIENT IDs SANS TROUS : C1 C3 => prochain C2
 def allocate_client_id() -> str:
     with mem_lock:
         used = set(k.upper() for k in clients_mem.keys())
@@ -204,7 +204,7 @@ def handle_client(conn, addr):
                 print(f"[MASTER] Routeur {rid} désenregistré.")
                 continue
 
-            # ✅ 0bis) CLIENT -> désenregistrement propre
+            # 0bis) CLIENT -> désenregistrement propre
             if pkt.startswith("UNREGISTER_CLIENT|"):
                 _, cid = pkt.split("|", 1)
                 cid = cid.strip().upper()
@@ -216,7 +216,7 @@ def handle_client(conn, addr):
                     print(f"[MASTER] Client {cid} désenregistré.")
                 continue
 
-            # 1) CLIENT -> liste routeurs (on prune avant de répondre)
+            # 1) CLIENT -> liste routeurs
             if pkt == "ROUTER_INFO_REQUEST":
                 prune_dead_routers()
                 routers = safe_get_routers()
@@ -227,7 +227,7 @@ def handle_client(conn, addr):
                 send_packet(conn, "ROUTER_INFO|" + ";".join(parts))
                 continue
 
-            # ✅ 1bis) CLIENT -> liste clients (pour GUI)
+            # 1bis) CLIENT -> liste clients (pour GUI)
             if pkt == "CLIENT_LIST_REQUEST":
                 prune_dead_clients()
                 with mem_lock:
@@ -269,7 +269,7 @@ def handle_client(conn, addr):
                 _, dest_id = pkt.split("|", 1)
                 dest_id = dest_id.strip().upper()
 
-                # d'abord noeuds.txt (si tu gardes des clients statiques)
+                # d'abord noeuds.txt (clients statiques)
                 try:
                     h, p = load_node(dest_id)
                     send_packet(conn, f"CLIENT_INFO|OK|{h}|{p}")

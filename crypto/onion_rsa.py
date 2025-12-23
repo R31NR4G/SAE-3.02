@@ -1,7 +1,3 @@
-# crypto/onion_rsa.py
-# RSA simplifié SAE 3.02 - Version SANS JSON et SANS typing
-# Format des ciphertext : "hex1:hex2:hex3"
-
 import random
 from math import gcd
 from sympy import isprime  # autorisé dans la SAE

@@ -256,7 +256,7 @@ class ClientGUI(QMainWindow):
         except Exception as e:
             self.log(f"Envoi impossible : {e}")
 
-    # Désenregistrement propre quand tu fermes la fenêtre
+    # Désenregistrement propre quand on ferme la fenêtre
     def closeEvent(self, event):
         try:
             cid = self.cid.text().strip().upper()
